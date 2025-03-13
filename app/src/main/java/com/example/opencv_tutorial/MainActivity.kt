@@ -18,12 +18,17 @@ import android.os.Build
 import androidx.core.content.ContextCompat
 import org.tensorflow.lite.gpu.CompatibilityList
 import java.util.Locale
+import android.content.Intent
+import android.widget.Button
+import androidx.constraintlayout.widget.ConstraintLayout
+import kotlinx.coroutines.*
 
 class MainActivity : AppCompatActivity() {
 
     // Views for UI
     private lateinit var imageView: ImageView
     private lateinit var resultText: TextView
+    private lateinit var mainLayout: ConstraintLayout
 
     // YOLOv11 detector instance
     private lateinit var yoloDetector: YOLO11Detector
@@ -31,13 +36,46 @@ class MainActivity : AppCompatActivity() {
     // Background thread for async loading
     private val backgroundExecutor = Executors.newSingleThreadExecutor()
 
+    // Coroutine scope for background operations
+    private val activityScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         // Initialize UI components
+        // Using the correct ID from the layout
+        mainLayout = findViewById(R.id.main_layout_container) // Assuming this is the correct ID in activity_main.xml
         imageView = findViewById(R.id.imageView)
         resultText = findViewById(R.id.resultText)
+
+        // Add camera button
+        val cameraButton = Button(this).apply {
+            text = "Start Real-Time Detection"
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, CameraActivity::class.java))
+            }
+        }
+
+        // Add button to layout
+        val buttonParams = ConstraintLayout.LayoutParams(
+            ConstraintLayout.LayoutParams.MATCH_PARENT,
+            ConstraintLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            bottomToBottom = ConstraintLayout.LayoutParams.PARENT_ID
+            startToStart = ConstraintLayout.LayoutParams.PARENT_ID
+            endToEnd = ConstraintLayout.LayoutParams.PARENT_ID
+            bottomMargin = 32
+            marginStart = 32
+            marginEnd = 32
+        }
+
+        mainLayout.addView(cameraButton, buttonParams)
+
+        // Display device capabilities and model information
+        activityScope.launch {
+            detectDeviceCapabilities()
+        }
 
         // Initialize OpenCV and proceed with detection in background
         initializeOpenCVAndDetector()
@@ -391,6 +429,70 @@ class MainActivity : AppCompatActivity() {
         return sampleSize
     }
 
+    /**
+     * Display device capabilities and model information
+     */
+    private suspend fun detectDeviceCapabilities() {
+        withContext(Dispatchers.IO) {
+            val sb = StringBuilder()
+
+            // Add device information
+            sb.appendLine("== Device Information ==")
+            sb.appendLine("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
+            sb.appendLine("Android: ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
+            sb.appendLine("Processors: ${Runtime.getRuntime().availableProcessors()}")
+
+            // Check TensorFlow Lite delegate support
+            val compatList = CompatibilityList()
+            val gpuSupported = compatList.isDelegateSupportedOnThisDevice
+            sb.appendLine("\n== TensorFlow Lite ==")
+            sb.appendLine("GPU Delegate: ${if (gpuSupported) "Supported" else "Not Supported"}")
+
+            // Check Neural Network API support
+            val nnApiSupported = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P
+            sb.appendLine("NNAPI: ${if (nnApiSupported) "Available (API ${android.os.Build.VERSION.SDK_INT})" else "Not Available"}")
+
+            // Check OpenCV initialization status
+            val opencvInitialized = try {
+                // Try to access a simple OpenCV function to check initialization
+                val opencvVersion = org.opencv.core.Core.VERSION
+                true
+            } catch (e: Exception) {
+                false
+            }
+            sb.appendLine("\n== OpenCV ==")
+            sb.appendLine("Status: ${if (opencvInitialized) "Initialized" else "Not Initialized"}")
+            sb.appendLine("Version: ${org.opencv.core.Core.VERSION}")
+
+            // Get model information
+            sb.appendLine("\n== YOLO Model ==")
+            try {
+                // Pre-warm model loading but don't run inference
+                val detector = YOLODetectorProvider.getDetector(this@MainActivity)
+                if (detector != null) {
+                    sb.appendLine("Model loaded successfully")
+                    sb.appendLine("Input details: ${detector.getInputDetails()}")
+                    sb.appendLine("Classes: ${detector.getClassName(0)}, ${detector.getClassName(1)}, ...")
+                } else {
+                    sb.appendLine("Model couldn't be loaded")
+                }
+            } catch (e: Exception) {
+                sb.appendLine("Model loading error: ${e.message}")
+                Log.e(TAG, "Error loading model", e)
+            }
+
+            // Recommend optimal settings
+            val delegateManager = TFLiteDelegateManager(this@MainActivity)
+            sb.appendLine("\n== Recommendations ==")
+            sb.appendLine("Optimal delegate: ${delegateManager.selectOptimalDelegate()}")
+
+            // Post results to UI thread
+            withContext(Dispatchers.Main) {
+                resultText.text = sb.toString()
+            }
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         // Clean up resources
@@ -399,6 +501,7 @@ class MainActivity : AppCompatActivity() {
         }
         // Shutdown executor service
         backgroundExecutor.shutdown()
+        activityScope.cancel()
     }
 
     companion object {

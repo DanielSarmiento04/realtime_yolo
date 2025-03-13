@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="16dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Detection Settings"
+        android:textAppearance="?attr/textAppearanceHeadline6"
+        android:textStyle="bold"
+        android:layout_marginBottom="16dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Confidence Threshold"
+        android:textAppearance="?attr/textAppearanceSubtitle1" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/confidenceSlider"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:valueFrom="1"
+            android:valueTo="100"
+            android:stepSize="1" />
+
+        <TextView
+            android:id="@+id/confidenceValueText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="25%"
+            android:textAppearance="?attr/textAppearanceBody1"
+            android:layout_marginStart="8dp"
+            android:minWidth="48dp" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Detection Resolution"
+        android:textAppearance="?attr/textAppearanceSubtitle1"
+        android:layout_marginTop="16dp" />
+
+    <RadioGroup
+        android:id="@+id/resolutionGroup"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <RadioButton
+            android:id="@+id/resolution320"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="320x320" />
+
+        <RadioButton
+            android:id="@+id/resolution640"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:text="640x640" />
+
+        <RadioButton
+            android:id="@+id/resolution1280"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="1280x720" />
+    </RadioGroup>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Bounding Box Style"
+        android:textAppearance="?attr/textAppearanceSubtitle1"
+        android:layout_marginTop="16dp" />
+
+    <RadioGroup
+        android:id="@+id/boxStyleGroup"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <RadioButton
+            android:id="@+id/boxStyleStroke"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Outline" />
+
+        <RadioButton
+            android:id="@+id/boxStyleFilled"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:text="Filled" />
+
+        <RadioButton
+            android:id="@+id/boxStyleCorners"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Corners" />
+    </RadioGroup>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="end"
+        android:layout_marginTop="16dp">
+
+        <Button
+            android:id="@+id/cancelButton"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Cancel" />
+
+        <Button
+            android:id="@+id/applyButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Apply" />
+    </LinearLayout>
+</LinearLayout>

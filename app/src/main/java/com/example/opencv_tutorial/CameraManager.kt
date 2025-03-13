@@ -16,6 +16,7 @@ import java.util.concurrent.Executors
 import org.opencv.android.Utils
 import org.opencv.core.Mat
 import org.opencv.imgproc.Imgproc
+import java.io.IOException
 import kotlin.math.roundToInt
 
 /**
@@ -349,26 +350,139 @@ class CameraManager(
 object YOLODetectorProvider {
     private var detector: YOLO11Detector? = null
     private val initLock = Any()
+    private const val TAG = "YOLODetectorProvider"
     
     fun getDetector(context: Context): YOLO11Detector? {
         if (detector == null) {
             synchronized(initLock) {
                 if (detector == null) {
                     try {
-                        detector = YOLO11Detector(
-                            context,
-                            "best_float32.tflite", // Model file in assets
-                            "coco.txt",       // Labels file in assets
-                            useGPU = true     // Enable GPU acceleration
+                        // Try multiple model variants, matching MainActivity's approach
+                        val modelVariants = listOf(
+                            "best_float16.tflite",  // Try float16 first (smaller, works on many devices)
+                            "best_float32.tflite",  // Try float32 as fallback (more compatible but larger)
+                            "best.tflite"           // Try default naming as last resort
                         )
+                        
+                        val labelsPath = "classes.txt"
+                        
+                        // Check GPU compatibility
+                        val useGPU = checkGpuCompatibility(context)
+                        Log.d(TAG, "GPU acceleration decision: $useGPU")
+                        
+                        // Try model variants in sequence until one works
+                        var lastException: Exception? = null
+                        
+                        for (modelFile in modelVariants) {
+                            try {
+                                // Check if file exists in assets
+                                try {
+                                    context.assets.open(modelFile).close()
+                                } catch (e: IOException) {
+                                    Log.d(TAG, "Model file $modelFile not found in assets, skipping")
+                                    continue
+                                }
+                                
+                                Log.d(TAG, "Attempting to load model: $modelFile")
+                                
+                                // Create detector with current model variant
+                                detector = YOLO11Detector(
+                                    context = context,
+                                    modelPath = modelFile,
+                                    labelsPath = labelsPath,
+                                    useGPU = useGPU
+                                )
+                                
+                                // If we get here, initialization succeeded
+                                Log.d(TAG, "Successfully initialized detector with model: $modelFile")
+                                break
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Failed to initialize with model $modelFile: ${e.message}")
+                                lastException = e
+                                
+                                // If this is GPU mode and failed, try again with CPU
+                                if (useGPU) {
+                                    try {
+                                        Log.d(TAG, "Retrying model $modelFile with CPU only")
+                                        detector = YOLO11Detector(
+                                            context = context,
+                                            modelPath = modelFile,
+                                            labelsPath = labelsPath,
+                                            useGPU = false
+                                        )
+                                        
+                                        // If we get here, CPU initialization succeeded
+                                        Log.d(TAG, "Successfully initialized detector with CPU and model: $modelFile")
+                                        break
+                                    } catch (cpuEx: Exception) {
+                                        Log.e(TAG, "CPU fallback also failed for $modelFile: ${cpuEx.message}")
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // If no model worked, log error
+                        if (detector == null && lastException != null) {
+                            Log.e(TAG, "Failed to initialize detector with any available model", lastException)
+                        }
                     } catch (e: Exception) {
-                        Log.e("YOLODetectorProvider", "Failed to initialize detector: ${e.message}")
+                        Log.e(TAG, "Failed to initialize detector: ${e.message}")
                         return null
                     }
                 }
             }
         }
         return detector
+    }
+
+    /**
+     * Check if the device is compatible with GPU acceleration
+     */
+    private fun checkGpuCompatibility(context: Context): Boolean {
+        // Check if GPU delegation is supported
+        val compatList = org.tensorflow.lite.gpu.CompatibilityList()
+        val isGpuSupported = compatList.isDelegateSupportedOnThisDevice
+        
+        // Check if running on emulator
+        val isEmulator = android.os.Build.FINGERPRINT.contains("generic") ||
+                android.os.Build.FINGERPRINT.startsWith("unknown") ||
+                android.os.Build.MODEL.contains("google_sdk") ||
+                android.os.Build.MODEL.contains("Emulator") ||
+                android.os.Build.MODEL.contains("Android SDK")
+        
+        // Check known problematic device models and manufacturers
+        val deviceModel = android.os.Build.MODEL.toLowerCase(java.util.Locale.ROOT)
+        val manufacturer = android.os.Build.MANUFACTURER.toLowerCase(java.util.Locale.ROOT)
+        
+        // List of known problematic device patterns
+        val problematicPatterns = listOf(
+            "mali-g57", "mali-g72", "mali-g52", "mali-g76",  // Some Mali GPUs have TFLite issues
+            "adreno 6", "adreno 5",                          // Some older Adreno GPUs
+            "mediatek", "mt6", "helio"                        // Some MediaTek chips
+        )
+        
+        val isProblematicDevice = problematicPatterns.any { pattern ->
+            deviceModel.contains(pattern) || manufacturer.contains(pattern)
+        }
+        
+        // Check Android version - some versions have known TFLite GPU issues
+        val androidVersion = android.os.Build.VERSION.SDK_INT
+        val isProblematicAndroidVersion = androidVersion < android.os.Build.VERSION_CODES.P  // Android 9-
+        
+        // Check available memory - GPU acceleration needs sufficient memory
+        val memoryInfo = android.app.ActivityManager.MemoryInfo()
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        activityManager.getMemoryInfo(memoryInfo)
+        
+        val availableMem = memoryInfo.availMem / (1024 * 1024)  // Convert to MB
+        val lowMemory = availableMem < 200  // Less than 200MB available
+        
+        // Final decision based on all factors
+        return isGpuSupported &&
+                !isEmulator &&
+                !isProblematicDevice &&
+                !isProblematicAndroidVersion &&
+                !lowMemory
     }
     
     fun releaseDetector() {

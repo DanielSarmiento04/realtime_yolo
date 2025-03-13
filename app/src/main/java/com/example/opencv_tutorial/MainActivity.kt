@@ -46,6 +46,7 @@ class MainActivity : AppCompatActivity() {
         // Initialize UI components
         // Using the correct ID from the layout
         mainLayout = findViewById(R.id.main_layout_container) // Assuming this is the correct ID in activity_main.xml
+
         imageView = findViewById(R.id.imageView)
         resultText = findViewById(R.id.resultText)
 

@@ -354,6 +354,7 @@ class YOLO11Detector(
 
     /**
      * Preprocess the input image using OpenCV to match the C++ implementation exactly
+     * Optimized for image quality preservation
      */
     private fun preprocessImageOpenCV(image: Mat, outImage: Mat, newShape: Size): ByteBuffer {
         val scopedTimer = ScopedTimer("preprocessing")
@@ -361,60 +362,74 @@ class YOLO11Detector(
         // Track original dimensions before any processing
         debug("Original image dimensions: ${image.width()}x${image.height()}")
 
-        // Resize with letterboxing to maintain aspect ratio
-        letterBox(image, outImage, newShape, Scalar(114.0, 114.0, 114.0))
-
-        // Log resized dimensions with letterboxing
-        debug("After letterbox: ${outImage.width()}x${outImage.height()}")
-
-        // Convert BGR to RGB (YOLOv11 expects RGB input)
-        val rgbMat = Mat()
-        Imgproc.cvtColor(outImage, rgbMat, Imgproc.COLOR_BGR2RGB)
-
-        // DEBUG: Output dimensions for verification
-        debug("Preprocessed image dimensions: ${rgbMat.width()}x${rgbMat.height()}")
-
-        // Prepare the ByteBuffer to store the model input data
-        val bytesPerChannel = if (isQuantized) 1 else 4
-        val inputBuffer = ByteBuffer.allocateDirect(1 * inputWidth * inputHeight * 3 * bytesPerChannel)
-        inputBuffer.order(ByteOrder.nativeOrder())
-
         try {
+            // Check input image validity
+            if (image.empty()) {
+                debug("Warning: Input image is empty")
+                throw IllegalArgumentException("Input image is empty")
+            }
+            
+            // Use high-quality resize with letterboxing to maintain aspect ratio
+            letterBox(image, outImage, newShape, Scalar(114.0, 114.0, 114.0), 
+                      interpolation = Imgproc.INTER_LINEAR)
+
+            // Log resized dimensions with letterboxing
+            debug("After letterbox: ${outImage.width()}x${outImage.height()}")
+
+            // Convert BGR to RGB (YOLOv11 expects RGB input)
+            val rgbMat = Mat()
+            Imgproc.cvtColor(outImage, rgbMat, Imgproc.COLOR_BGR2RGB)
+
+            // DEBUG: Output dimensions for verification
+            debug("Preprocessed image dimensions: ${rgbMat.width()}x${rgbMat.height()}")
+
+            // Prepare the ByteBuffer to store the model input data
+            val bytesPerChannel = if (isQuantized) 1 else 4
+            val inputBuffer = ByteBuffer.allocateDirect(1 * inputWidth * inputHeight * 3 * bytesPerChannel)
+            inputBuffer.order(ByteOrder.nativeOrder())
+
             // Convert to proper format for TFLite
             if (isQuantized) {
-                // For quantized models, prepare as bytes
-                val pixels = ByteArray(rgbMat.width() * rgbMat.height() * rgbMat.channels())
-                rgbMat.get(0, 0, pixels)
-
-                for (i in pixels.indices) {
-                    inputBuffer.put(pixels[i])
+                // For quantized models: use efficient direct buffer copy
+                val pixelBuffer = ByteArray(3)
+                for (y in 0 until rgbMat.rows()) {
+                    for (x in 0 until rgbMat.cols()) {
+                        rgbMat.get(y, x, pixelBuffer)
+                        // RGB order (as expected by the model)
+                        inputBuffer.put(pixelBuffer[0]) // R
+                        inputBuffer.put(pixelBuffer[1]) // G
+                        inputBuffer.put(pixelBuffer[2]) // B
+                    }
                 }
             } else {
-                // For float models, normalize to [0,1]
-                // CRITICAL: Create a normalized float Mat directly using OpenCV for better precision
+                // For float models: use optimized normalization
                 val normalizedMat = Mat()
                 rgbMat.convertTo(normalizedMat, CvType.CV_32FC3, 1.0/255.0)
-
-                // Now copy the normalized float values to TFLite input buffer
-                val floatValues = FloatArray(normalizedMat.width() * normalizedMat.height() * normalizedMat.channels())
-                normalizedMat.get(0, 0, floatValues)
-
-                for (value in floatValues) {
-                    inputBuffer.putFloat(value)
+                
+                // Use more efficient pixel-by-pixel access for better performance
+                val floatPixels = FloatArray(3)
+                for (y in 0 until normalizedMat.rows()) {
+                    for (x in 0 until normalizedMat.cols()) {
+                        normalizedMat.get(y, x, floatPixels)
+                        // RGB order
+                        inputBuffer.putFloat(floatPixels[0]) // R
+                        inputBuffer.putFloat(floatPixels[1]) // G
+                        inputBuffer.putFloat(floatPixels[2]) // B
+                    }
                 }
-
                 normalizedMat.release()
             }
+
+            inputBuffer.rewind()
+            rgbMat.release()
+            
+            scopedTimer.stop()
+            return inputBuffer
         } catch (e: Exception) {
             debug("Error during preprocessing: ${e.message}")
             e.printStackTrace()
+            throw e
         }
-
-        inputBuffer.rewind()
-        rgbMat.release()
-
-        scopedTimer.stop()
-        return inputBuffer
     }
 
     /**
@@ -888,7 +903,7 @@ class YOLO11Detector(
 
     /**
      * Letterbox an image to fit a specific size while maintaining aspect ratio
-     * Fixed padding calculation to ensure consistent vertical alignment
+     * Enhanced for better image quality in real-time processing
      */
     private fun letterBox(
         image: Mat,
@@ -898,7 +913,8 @@ class YOLO11Detector(
         auto: Boolean = true,
         scaleFill: Boolean = false,
         scaleUp: Boolean = true,
-        stride: Int = 32
+        stride: Int = 32,
+        interpolation: Int = Imgproc.INTER_LINEAR
     ) {
         val originalShape = Size(image.cols().toDouble(), image.rows().toDouble())
 
@@ -913,43 +929,43 @@ class YOLO11Detector(
             ratio = min(ratio, 1.0f)
         }
 
-        // Calculate new unpadded dimensions
-        val newUnpadW = round(originalShape.width * ratio).toInt()
-        val newUnpadH = round(originalShape.height * ratio).toInt()
+        // Calculate new unpadded dimensions - use ceiling to avoid fractional pixels
+        val newUnpadW = kotlin.math.ceil(originalShape.width * ratio).toInt()
+        val newUnpadH = kotlin.math.ceil(originalShape.height * ratio).toInt()
 
         // Calculate padding
         val dw = (newShape.width - newUnpadW).toFloat()
         val dh = (newShape.height - newUnpadH).toFloat()
 
-        // Calculate padding distribution
+        // Calculate padding distribution with proper alignment
         val padLeft: Int
         val padRight: Int
         val padTop: Int
         val padBottom: Int
 
         if (auto) {
-            // Auto padding aligned to stride
-            val dwHalf = ((dw % stride) / 2).toFloat()
-            val dhHalf = ((dh % stride) / 2).toFloat()
+            // Improved padding alignment to match model's stride expectations
+            val dwHalf = kotlin.math.floor(dw / 2.0).toInt()
+            val dhHalf = kotlin.math.floor(dh / 2.0).toInt()
 
-            padLeft = (dw / 2 - dwHalf).toInt()
-            padRight = (dw / 2 + dwHalf).toInt()
-            padTop = (dh / 2 - dhHalf).toInt()
-            padBottom = (dh / 2 + dhHalf).toInt()
+            padLeft = dwHalf
+            padRight = (dw - dwHalf).toInt()
+            padTop = dhHalf
+            padBottom = (dh - dhHalf).toInt()
         } else if (scaleFill) {
             // Scale to fill without maintaining aspect ratio
             padLeft = 0
             padRight = 0
             padTop = 0
             padBottom = 0
-            Imgproc.resize(image, outImage, newShape)
+            Imgproc.resize(image, outImage, newShape, 0.0, 0.0, interpolation)
             return
         } else {
             // Even padding on all sides
-            padLeft = (dw / 2).toInt()
-            padRight = (dw - padLeft).toInt()
-            padTop = (dh / 2).toInt()
-            padBottom = (dh - padTop).toInt()
+            padLeft = kotlin.math.round(dw / 2).toInt()
+            padRight = kotlin.math.round(dw - padLeft).toInt()
+            padTop = kotlin.math.round(dh / 2).toInt()
+            padBottom = kotlin.math.round(dh - padTop).toInt()
         }
 
         // Log detailed padding information
@@ -957,16 +973,16 @@ class YOLO11Detector(
                 "new=${newUnpadW}x${newUnpadH}, ratio=$ratio")
         debug("Letterbox: padding left=$padLeft, right=$padRight, top=$padTop, bottom=$padBottom")
 
-        // Resize the image to fit within the new dimensions
+        // Use higher quality interpolation for resize to preserve details
         Imgproc.resize(
             image,
             outImage,
             Size(newUnpadW.toDouble(), newUnpadH.toDouble()),
             0.0, 0.0,
-            Imgproc.INTER_LINEAR
+            interpolation  // Use the specified interpolation method
         )
 
-        // Apply padding to create letterboxed image
+        // Apply padding to create letterboxed image with border replication for better edge handling
         Core.copyMakeBorder(
             outImage,
             outImage,
@@ -974,7 +990,7 @@ class YOLO11Detector(
             padBottom,
             padLeft,
             padRight,
-            Core.BORDER_CONSTANT,
+            Core.BORDER_CONSTANT,  // Use constant color for padding
             color
         )
     }

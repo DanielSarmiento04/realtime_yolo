@@ -3,6 +3,7 @@ package com.example.opencv_tutorial
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.ImageFormat
 import android.os.Bundle
 import android.util.Log
 import android.view.View
@@ -15,6 +16,8 @@ import kotlinx.coroutines.*
 import android.widget.ImageButton
 import android.widget.TextView
 import androidx.cardview.widget.CardView
+import org.opencv.android.OpenCVLoader
+import org.opencv.core.CvType
 import org.tensorflow.lite.support.metadata.MetadataExtractor
 import java.io.IOException
 import java.nio.ByteBuffer
@@ -52,6 +55,14 @@ class CameraActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_camera)
+
+        // Initialize OpenCV
+        if (!OpenCVLoader.initDebug()) {
+            Log.e(TAG, "Error initializing OpenCV")
+            Toast.makeText(this, "Error initializing OpenCV", Toast.LENGTH_SHORT).show()
+            finish()
+            return
+        }
 
         // Initialize UI components
         viewFinder = findViewById(R.id.viewFinder)

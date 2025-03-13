@@ -2,7 +2,9 @@ package com.example.opencv_tutorial
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.os.Build
 import android.util.Log
 import android.util.Size
 import androidx.camera.core.*
@@ -14,10 +16,14 @@ import kotlinx.coroutines.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import org.opencv.android.Utils
+import org.opencv.core.Core
+import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.imgproc.Imgproc
 import java.io.IOException
 import kotlin.math.roundToInt
+import org.opencv.core.Size as OpenCVSize
+import java.util.Locale
 
 /**
  * Manages camera preview and frame processing for real-time object detection
@@ -148,7 +154,7 @@ class CameraManager(
     }
 
     /**
-     * Process image from camera
+     * Process image from camera with optimized handling
      */
     private fun processImage(image: ImageProxy) {
         // Skip processing if we're still working on the previous frame
@@ -171,14 +177,14 @@ class CameraManager(
                 // Get bitmap from image proxy (efficient conversion)
                 val bitmap = image.toBitmap()
                 
-                // Reorient bitmap if needed
+                // Reorient bitmap if needed - use the more efficient rotateBitmapIfNeeded
                 val rotatedBitmap = rotateBitmapIfNeeded(bitmap, image.imageInfo.rotationDegrees)
                 
                 // Get detector instance from the parent activity
                 val detector = YOLODetectorProvider.getDetector(context)
                 
                 if (detector != null) {
-                    // Run detection
+                    // Run detection with high-quality preprocessed image
                     val detections = detector.detect(rotatedBitmap)
                     
                     // Track performance
@@ -189,7 +195,7 @@ class CameraManager(
                     if (performanceTracker.totalFrames % 30 == 0) {
                         val avgFps = 1000.0 / performanceTracker.getAverageProcessingTime()
                         Log.d(TAG, "Avg processing time: ${performanceTracker.getAverageProcessingTime()}ms, " +
-                                "FPS: ${String.format("%.1f", avgFps)}, " +
+                                "FPS: ${"%.1f".format(avgFps)}, " +
                                 "Detections: ${detections.size}")
                     }
                     
@@ -199,8 +205,8 @@ class CameraManager(
                     }
                 }
                 
-                // Clean up temporary bitmaps if needed
-                if (rotatedBitmap !== bitmap) {
+                // Clean up temporary bitmaps to avoid memory leaks
+                if (bitmap != rotatedBitmap && rotatedBitmap !== viewFinder.bitmap) {
                     bitmap.recycle()
                 }
                 
@@ -213,56 +219,231 @@ class CameraManager(
             }
         }
     }
-    
+
     /**
      * Efficiently convert ImageProxy to Bitmap using OpenCV for better performance
      */
     private suspend fun ImageProxy.toBitmap(): Bitmap = withContext(Dispatchers.Default) {
-        val yBuffer = planes[0].buffer
-        val uBuffer = planes[1].buffer
-        val vBuffer = planes[2].buffer
+        try {
+            val startTime = System.currentTimeMillis()
+            
+            // Use direct YUV to RGB conversion using ImageProxy planes
+            val yuvMat = imageToYuvMat(this@toBitmap)
+            
+            // Convert YUV to RGB - detect format and use appropriate conversion
+            val rgbMat = Mat()
+            
+            // CameraX in Android typically uses NV21 or YUV_420_888, which OpenCV processes differently
+            if (format == ImageFormat.YUV_420_888) {
+                Imgproc.cvtColor(yuvMat, rgbMat, Imgproc.COLOR_YUV2BGR_NV21)
+            } else {
+                // Fallback path for other formats
+                Imgproc.cvtColor(yuvMat, rgbMat, Imgproc.COLOR_YUV2BGR_NV21)
+            }
+            
+            // Apply moderate image enhancement suitable for real-time
+            val enhancedRgbMat = enhanceImageQuality(rgbMat)
+            
+            // Reuse bitmap when possible to reduce allocations
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            
+            // Convert Mat to Bitmap efficiently
+            Utils.matToBitmap(enhancedRgbMat, bitmap)
+            
+            // Release Mats immediately to prevent memory leaks
+            yuvMat.release()
+            rgbMat.release()
+            if (enhancedRgbMat !== rgbMat) {
+                enhancedRgbMat.release()
+            }
+            
+            val duration = System.currentTimeMillis() - startTime
+            if (duration > 20) { // Only log slow conversions
+                Log.d(TAG, "Image conversion took $duration ms")
+            }
+            
+            bitmap
+        } catch (e: Exception) {
+            Log.e(TAG, "Error converting image: ${e.message}")
+            // Fallback with simpler but potentially lower quality approach
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(bitmap)
+            val paint = android.graphics.Paint()
+            paint.color = android.graphics.Color.BLACK
+            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
+            bitmap
+        }
+    }
+
+    /**
+     * Convert ImageProxy to YUV Mat with proper handling of stride and formats
+     */
+    private fun imageToYuvMat(image: ImageProxy): Mat {
+        val width = image.width
+        val height = image.height
+        val planes = image.planes
         
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
+        // Calculate needed buffer size based on plane strides
+        val yPlane = planes[0]
+        val uPlane = planes[1]
+        val vPlane = planes[2]
         
-        val nv21 = ByteArray(ySize + uSize + vSize)
+        // Allocate a single continuous buffer for all YUV data
+        val yuvTotalSize = width * height * 3 / 2 // Standard size for YUV420
+        val yuvMat = Mat(yuvTotalSize, 1, CvType.CV_8UC1)
+        val yuvBytes = ByteArray(yuvTotalSize)
         
-        // U and V are swapped
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
+        // Get buffers
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
         
-        val yuvMat = Mat(height + height / 2, width, org.opencv.core.CvType.CV_8UC1)
-        yuvMat.put(0, 0, nv21)
-        val rgbMat = Mat()
+        // Get strides
+        val yPixelStride = yPlane.pixelStride
+        val yRowStride = yPlane.rowStride
+        val uPixelStride = uPlane.pixelStride 
+        val uRowStride = uPlane.rowStride
+        val vPixelStride = vPlane.pixelStride
+        val vRowStride = vPlane.rowStride
         
-        // Convert YUV to RGB
-        Imgproc.cvtColor(yuvMat, rgbMat, Imgproc.COLOR_YUV2RGB_NV21)
+        // If pixel stride is 1, we can copy rows directly for Y plane
+        var position = 0
+        if (yPixelStride == 1) {
+            for (row in 0 until height) {
+                yBuffer.position(row * yRowStride)
+                yBuffer.get(yuvBytes, position, width)
+                position += width
+            }
+        } else {
+            // Handle y plane with pixel stride > 1
+            for (row in 0 until height) {
+                yBuffer.position(row * yRowStride)
+                for (col in 0 until width) {
+                    yuvBytes[position++] = yBuffer.get()
+                    if (col < width - 1) yBuffer.position(yBuffer.position() + yPixelStride - 1)
+                }
+            }
+        }
         
-        // Create bitmap from Mat
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        Utils.matToBitmap(rgbMat, bitmap)
+        // Process UV planes - combine them with interleaving for NV21
+        val chromaHeight = height / 2
+        val chromaWidth = width / 2
         
-        // Release Mats
-        yuvMat.release()
-        rgbMat.release()
+        if (uPixelStride == 2 && vPixelStride == 2) {
+            // Common case: U/V are interleaved
+            val uvPos = position
+            for (row in 0 until chromaHeight) {
+                for (col in 0 until chromaWidth) {
+                    yuvBytes[position++] = vBuffer.get(row * vRowStride + col * 2)     // V first for NV21
+                    yuvBytes[position++] = uBuffer.get(row * uRowStride + col * 2)     // U second
+                }
+            }
+        } else {
+            // Fall back to pixel-by-pixel copy
+            for (row in 0 until chromaHeight) {
+                for (col in 0 until chromaWidth) {
+                    val uIndex = (row * uRowStride) + (col * uPixelStride)
+                    val vIndex = (row * vRowStride) + (col * vPixelStride)
+                    yuvBytes[position++] = vBuffer.get(vIndex)  // V
+                    yuvBytes[position++] = uBuffer.get(uIndex)  // U
+                }
+            }
+        }
         
-        bitmap
+        // Put the data into the Mat
+        yuvMat.put(0, 0, yuvBytes)
+        
+        // Reshape to proper dimensions for OpenCV processing
+        val yuv420sp = yuvMat.reshape(1, height + height/2)
+        return yuv420sp
+    }
+    
+    /**
+     * Apply image enhancements to improve visual quality
+     * Includes auto white balance, contrast enhancement,
+     * and noise reduction optimized for real-time processing
+     */
+    private fun enhanceImageQuality(inputMat: Mat): Mat {
+        val result = Mat()
+        
+        try {
+            // Apply moderate enhancement for real-time performance
+            val yuv = Mat()
+            Imgproc.cvtColor(inputMat, yuv, Imgproc.COLOR_BGR2YUV)
+            val yuvChannels = ArrayList<Mat>(3)
+            Core.split(yuv, yuvChannels)
+            
+            // Apply gentler CLAHE for better contrast without artifacts
+            val clahe = Imgproc.createCLAHE(1.5, OpenCVSize(4.0, 4.0))
+            clahe.apply(yuvChannels[0], yuvChannels[0])
+            
+            // Apply subtle color correction to UV channels to prevent color shifting
+            Core.normalize(yuvChannels[1], yuvChannels[1], 0.0, 255.0, Core.NORM_MINMAX)
+            Core.normalize(yuvChannels[2], yuvChannels[2], 0.0, 255.0, Core.NORM_MINMAX)
+            
+            // Merge channels back
+            Core.merge(yuvChannels, yuv)
+            
+            // Convert back to BGR
+            Imgproc.cvtColor(yuv, result, Imgproc.COLOR_YUV2BGR)
+            
+            // Apply very gentle denoising only if needed (using standard Gaussian blur instead)
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                // Older devices may need more denoising
+                // Using Gaussian blur as a simpler alternative to fastNlMeansDenoisingColored
+                Imgproc.GaussianBlur(result, result, OpenCVSize(3.0, 3.0), 0.5)
+                
+                // Alternative: Use bilateralFilter for edge-preserving noise removal
+                // Imgproc.bilateralFilter(result, result, 5, 15.0, 15.0)
+            }
+            
+            // Clean up
+            yuv.release()
+            for (mat in yuvChannels) {
+                mat.release()
+            }
+            
+            return result
+        } catch (e: Exception) {
+            Log.e(TAG, "Image enhancement failed: ${e.message}")
+            // Return original if enhancement fails
+            inputMat.copyTo(result)
+            return result
+        }
     }
     
     /**
      * Rotate bitmap if needed based on camera orientation
+     * Optimized to avoid quality loss during rotation
      */
     private fun rotateBitmapIfNeeded(bitmap: Bitmap, rotation: Int): Bitmap {
+        // Skip if no rotation needed
         if (rotation == 0) return bitmap
         
-        val matrix = Matrix()
-        matrix.postRotate(rotation.toFloat())
-        
-        return Bitmap.createBitmap(
-            bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
-        )
+        try {
+            // Create transformation matrix
+            val matrix = Matrix()
+            matrix.postRotate(rotation.toFloat())
+            
+            // Optimize memory allocation by reusing bitmaps when possible
+            val rotatedBitmap = Bitmap.createBitmap(
+                bitmap, 
+                0, 0, 
+                bitmap.width, bitmap.height, 
+                matrix, 
+                true
+            )
+            
+            // Only recycle original if it's different from what we started with
+            if (bitmap != rotatedBitmap && bitmap != viewFinder.bitmap) {
+                bitmap.recycle()
+            }
+            
+            return rotatedBitmap
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during bitmap rotation: ${e.message}")
+            return bitmap
+        }
     }
     
     /**

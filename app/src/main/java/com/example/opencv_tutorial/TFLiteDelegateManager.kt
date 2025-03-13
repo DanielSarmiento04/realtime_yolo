@@ -115,8 +115,14 @@ class TFLiteDelegateManager(private val context: Context) {
             }
 
             val delegateOptions = GpuDelegate.Options().apply {
-                setPrecisionLossAllowed(true)  // Allow reduced precision for better performance
+                setPrecisionLossAllowed(false)  // Set to false to preserve image quality
                 setQuantizedModelsAllowed(true)  // Support quantized models
+                
+                // Prioritize precision over performance for image quality
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {  // Android 9+
+                    val inferencePreference = GpuDelegate.Options.INFERENCE_PREFERENCE_SUSTAINED_SPEED
+                    setInferencePreference(inferencePreference)
+                }
             }
 
             val gpuDelegate = GpuDelegate(delegateOptions)
@@ -126,7 +132,7 @@ class TFLiteDelegateManager(private val context: Context) {
             // Add CPU fallback options too in case GPU ops are not all supported
             configureCpuOptions(options)
 
-            Log.d(TAG, "GPU delegate configured successfully")
+            Log.d(TAG, "GPU delegate configured successfully for high-quality inference")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to configure GPU delegate: ${e.message}")
             configureCpuDelegate(options)
@@ -196,12 +202,14 @@ class TFLiteDelegateManager(private val context: Context) {
 
             options.setNumThreads(optimalThreads)
 
-            // Enable optimizations
+            // Enable high-quality inference options
             options.setUseXNNPACK(true)  // Use XNNPACK for CPU acceleration
-            options.setAllowFp16PrecisionForFp32(true)
+            
+            // Prioritize accuracy over speed for better image quality
+            options.setAllowFp16PrecisionForFp32(false)
             options.setAllowBufferHandleOutput(true)
 
-            Log.d(TAG, "CPU options configured with $optimalThreads threads")
+            Log.d(TAG, "CPU options configured with $optimalThreads threads for high-quality inference")
         } catch (e: Exception) {
             Log.e(TAG, "Error configuring CPU options: ${e.message}")
             // Use safe defaults

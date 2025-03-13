@@ -7,6 +7,7 @@ import android.view.View
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 import kotlin.math.min
+import android.util.Log
 
 /**
  * Custom view that overlays detection results on the camera preview
@@ -72,13 +73,44 @@ class DetectionOverlayView @JvmOverloads constructor(
 
     /**
      * Update the overlay with new bitmap and detections
+     * Optimized to maintain image quality in real-time
      */
     fun updateOverlay(bitmap: Bitmap, detections: List<YOLO11Detector.Detection>) {
-        // Update atomic references
-        val oldBitmap = currentBitmap.getAndSet(bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, true))
-        oldBitmap?.recycle() // Clean up previous bitmap
+        // Filter detections by confidence threshold
+        val filteredDetections = detections.filter { it.conf >= confidenceThreshold }
         
-        currentDetections.set(detections.filter { it.conf >= confidenceThreshold })
+        try {
+            // Check if we need to create a new bitmap or can reuse existing one
+            val oldBitmap = currentBitmap.get()
+            val needNewBitmap = oldBitmap == null || 
+                                oldBitmap.width != bitmap.width || 
+                                oldBitmap.height != bitmap.height
+            
+            val displayBitmap: Bitmap
+            
+            if (needNewBitmap) {
+                // Create a new bitmap if needed
+                displayBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+                
+                // Clean up old bitmap if it exists
+                oldBitmap?.recycle()
+            } else {
+                // Reuse existing bitmap for better performance
+                displayBitmap = oldBitmap!!
+                
+                // Copy pixels from new bitmap to existing one
+                val canvas = Canvas(displayBitmap)
+                canvas.drawBitmap(bitmap, 0f, 0f, null)  // Direct usage since bitmap is non-null here
+            }
+            
+            // Update atomic references - save the bitmap first
+            currentBitmap.set(displayBitmap)
+            currentDetections.set(filteredDetections)
+        } catch (e: Exception) {
+            Log.e("DetectionOverlayView", "Error updating overlay: ${e.message}")
+            // Still update detections even if bitmap update fails
+            currentDetections.set(filteredDetections)
+        }
         
         // Request redraw
         postInvalidate()
@@ -107,13 +139,20 @@ class DetectionOverlayView @JvmOverloads constructor(
             top = 0f
         }
         
+        // Apply high-quality rendering settings
+        val paint = Paint().apply {
+            isAntiAlias = true
+            isFilterBitmap = true
+            isDither = true
+        }
+        
         // Scale canvas for proper display
         canvas.save()
         canvas.translate(left, top)
         canvas.scale(scale, scale)
         
         // Draw the bitmap first
-        canvas.drawBitmap(bitmap, 0f, 0f, null)
+        canvas.drawBitmap(bitmap, 0f, 0f, paint)
         
         // Draw all detections
         for (detection in detections) {

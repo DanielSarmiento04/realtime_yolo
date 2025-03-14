@@ -25,6 +25,7 @@ import java.util.*
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.round
+import kotlin.math.ceil
 //import android.util.Log
 
 /**
@@ -361,34 +362,25 @@ class YOLO11Detector(
         // Track original dimensions before any processing
         debug("Original image dimensions: ${image.width()}x${image.height()}")
         
-        // Select optimal interpolation method based on scaling direction
-        val interpolationMethod = if (image.width() * image.height() > inputWidth * inputHeight) {
-            // Downscaling - use area interpolation for better quality when reducing size
-            Imgproc.INTER_AREA
-        } else {
-            // Upscaling - use cubic interpolation for better quality when increasing size
-            Imgproc.INTER_CUBIC
-        }
+        // FIXED: Use a consistent interpolation method for better quality
+        val interpolationMethod = Imgproc.INTER_AREA
         
-        // Apply bilateral filter for edge-preserving noise reduction (better than Gaussian for details)
-        val denoised = Mat()
-        Imgproc.bilateralFilter(image, denoised, 5, 75.0, 75.0)
+        // FIXED: Remove bilateral filter which causes color distortion
+        // Just use the input image directly
         
-        // Resize with letterboxing to maintain aspect ratio
-        letterBox(denoised, outImage, newShape, Scalar(114.0, 114.0, 114.0), 
-                  auto = true, scaleFill = false, scaleUp = true, stride = 32, 
+        // FIXED: Modified letterBox to minimize padding
+        letterBox(image, outImage, newShape, Scalar(114.0, 114.0, 114.0), 
+                  auto = false, scaleFill = false, scaleUp = true, stride = 1, 
                   interpolation = interpolationMethod)
-        denoised.release()
         
         // Log resized dimensions with letterboxing
         debug("After letterbox: ${outImage.width()}x${outImage.height()}")
         
-        // Convert BGR to RGB (YOLOv11 expects RGB input)
+        // FIXED: Ensure consistent color conversion - OpenCV uses BGR, but YOLO expects RGB
         val rgbMat = Mat()
         Imgproc.cvtColor(outImage, rgbMat, Imgproc.COLOR_BGR2RGB)
         
-        // Apply subtle contrast enhancement for better detection
-        Core.normalize(rgbMat, rgbMat, 0.0, 255.0, Core.NORM_MINMAX)
+        // FIXED: Remove contrast enhancement which can cause color distortion
         
         // Prepare the ByteBuffer to store the model input data
         val bytesPerChannel = if (isQuantized) 1 else 4
@@ -435,16 +427,17 @@ class YOLO11Detector(
 
     /**
      * Enhanced letterBox function with interpolation control
+     * FIXED: Modified to minimize padding and improve alignment
      */
     private fun letterBox(
         image: Mat,
         outImage: Mat,
         newShape: Size,
         color: Scalar = Scalar(114.0, 114.0, 114.0),
-        auto: Boolean = true,
+        auto: Boolean = false, // FIXED: Changed default to false to disable auto padding
         scaleFill: Boolean = false,
         scaleUp: Boolean = true,
-        stride: Int = 32,
+        stride: Int = 1, // FIXED: Changed from 32 to 1 to minimize padding
         interpolation: Int = Imgproc.INTER_LINEAR
     ) {
         val originalShape = Size(image.cols().toDouble(), image.rows().toDouble())
@@ -464,7 +457,7 @@ class YOLO11Detector(
         val newUnpadW = round(originalShape.width * ratio).toInt()
         val newUnpadH = round(originalShape.height * ratio).toInt()
         
-        // Calculate padding
+        // Calculate padding - FIXED: Minimize padding as much as possible
         val dw = (newShape.width - newUnpadW).toFloat()
         val dh = (newShape.height - newUnpadH).toFloat()
         
@@ -475,7 +468,7 @@ class YOLO11Detector(
         val padBottom: Int
         
         if (auto) {
-            // Auto padding aligned to stride
+            // Auto padding aligned to stride - FIXED: Use smaller stride
             val dwHalf = ((dw % stride) / 2).toFloat()
             val dhHalf = ((dh % stride) / 2).toFloat()
             
@@ -492,11 +485,11 @@ class YOLO11Detector(
             Imgproc.resize(image, outImage, newShape, 0.0, 0.0, interpolation)
             return
         } else {
-            // Even padding on all sides
+            // FIXED: Minimize padding by using exact division
             padLeft = (dw / 2).toInt()
-            padRight = (dw - padLeft).toInt()
+            padRight = (ceil(dw - padLeft).toFloat()).toInt()
             padTop = (dh / 2).toInt()
-            padBottom = (dh - padTop).toInt()
+            padBottom = (ceil(dh - padTop).toFloat()).toInt()
         }
         
         // Resize the image to fit within the new dimensions with specified interpolation
@@ -508,17 +501,78 @@ class YOLO11Detector(
             interpolation
         )
         
-        // Apply padding to create letterboxed image
-        Core.copyMakeBorder(
-            outImage,
-            outImage,
-            padTop,
-            padBottom,
-            padLeft,
-            padRight,
-            Core.BORDER_CONSTANT,
-            color
-        )
+        // Apply padding to create letterboxed image - FIXED: Use minimal padding
+        if (padTop > 0 || padBottom > 0 || padLeft > 0 || padRight > 0) {
+            Core.copyMakeBorder(
+                outImage,
+                outImage,
+                padTop,
+                padBottom,
+                padLeft,
+                padRight,
+                Core.BORDER_CONSTANT,
+                color
+            )
+        }
+        
+        // Log detailed padding information for debugging
+        debug("Letterbox: padding left=$padLeft, right=$padRight, top=$padTop, bottom=$padBottom")
+    }
+
+    /**
+     * Scale coordinates from model input size to original image size
+     * FIXED: Improved coordinate scaling to account for minimal padding
+     */
+    private fun scaleCoords(
+        imageShape: Size,
+        coords: RectF,
+        imageOriginalShape: Size,
+        clip: Boolean = true
+    ): RectF {
+        // Get dimensions in pixels
+        val inputWidth = imageShape.width.toFloat()
+        val inputHeight = imageShape.height.toFloat()
+        val originalWidth = imageOriginalShape.width.toFloat()
+        val originalHeight = imageOriginalShape.height.toFloat()
+
+        // Calculate scaling factor (ratio) between original and input sizes
+        val gain = min(inputWidth / originalWidth, inputHeight / originalHeight)
+
+        // Calculate padding needed for letterboxing
+        val padX = (inputWidth - originalWidth * gain) / 2.0f
+        val padY = (inputHeight - originalHeight * gain) / 2.0f
+
+        // Debug dimensions
+        debug("Scale coords: input=${inputWidth}x${inputHeight}, original=${originalWidth}x${originalHeight}")
+        debug("Scale coords: gain=$gain, padding=($padX, $padY)")
+        debug("Scale coords: input normalized=(${coords.left}, ${coords.top}, ${coords.right}, ${coords.bottom})")
+
+        // Convert normalized coordinates [0-1] to absolute pixel coordinates
+        val absLeft = coords.left * inputWidth
+        val absTop = coords.top * inputHeight
+        val absRight = coords.right * inputWidth
+        val absBottom = coords.bottom * inputHeight
+
+        // FIXED: Improved padding compensation for more accurate coordinates
+        val x1 = max(0f, (absLeft - padX) / gain)
+        val y1 = max(0f, (absTop - padY) / gain)
+        val x2 = min(originalWidth, (absRight - padX) / gain)
+        val y2 = min(originalHeight, (absBottom - padY) / gain)
+
+        debug("Scale coords: output original=($x1, $y1, $x2, $y2)")
+
+        // Create result rectangle - FIXED: Ensure box is fully within image bounds
+        val result = RectF(x1, y1, x2, y2)
+
+        // Clip to image boundaries if requested
+        if (clip) {
+            result.left = max(0f, result.left)
+            result.top = max(0f, result.top)
+            result.right = min(result.right, originalWidth)
+            result.bottom = min(result.bottom, originalHeight)
+        }
+
+        return result
     }
 
     /**
@@ -989,157 +1043,6 @@ class YOLO11Detector(
     /**
      * Helper functions
      */
-
-    /**
-     * Letterbox an image to fit a specific size while maintaining aspect ratio
-     * Fixed padding calculation to ensure consistent vertical alignment
-     */
-    private fun letterBox(
-        image: Mat,
-        outImage: Mat,
-        newShape: Size,
-        color: Scalar = Scalar(114.0, 114.0, 114.0),
-        auto: Boolean = true,
-        scaleFill: Boolean = false,
-        scaleUp: Boolean = true,
-        stride: Int = 32
-    ) {
-        val originalShape = Size(image.cols().toDouble(), image.rows().toDouble())
-
-        // Calculate ratio to fit the image within new shape
-        var ratio = min(
-            newShape.height / originalShape.height,
-            newShape.width / originalShape.width
-        ).toFloat()
-
-        // Prevent scaling up if not allowed
-        if (!scaleUp) {
-            ratio = min(ratio, 1.0f)
-        }
-
-        // Calculate new unpadded dimensions
-        val newUnpadW = round(originalShape.width * ratio).toInt()
-        val newUnpadH = round(originalShape.height * ratio).toInt()
-
-        // Calculate padding
-        val dw = (newShape.width - newUnpadW).toFloat()
-        val dh = (newShape.height - newUnpadH).toFloat()
-
-        // Calculate padding distribution
-        val padLeft: Int
-        val padRight: Int
-        val padTop: Int
-        val padBottom: Int
-
-        if (auto) {
-            // Auto padding aligned to stride
-            val dwHalf = ((dw % stride) / 2).toFloat()
-            val dhHalf = ((dh % stride) / 2).toFloat()
-
-            padLeft = (dw / 2 - dwHalf).toInt()
-            padRight = (dw / 2 + dwHalf).toInt()
-            padTop = (dh / 2 - dhHalf).toInt()
-            padBottom = (dh / 2 + dhHalf).toInt()
-        } else if (scaleFill) {
-            // Scale to fill without maintaining aspect ratio
-            padLeft = 0
-            padRight = 0
-            padTop = 0
-            padBottom = 0
-            Imgproc.resize(image, outImage, newShape)
-            return
-        } else {
-            // Even padding on all sides
-            padLeft = (dw / 2).toInt()
-            padRight = (dw - padLeft).toInt()
-            padTop = (dh / 2).toInt()
-            padBottom = (dh - padTop).toInt()
-        }
-
-        // Log detailed padding information
-        debug("Letterbox: original=${originalShape.width}x${originalShape.height}, " +
-                "new=${newUnpadW}x${newUnpadH}, ratio=$ratio")
-        debug("Letterbox: padding left=$padLeft, right=$padRight, top=$padTop, bottom=$padBottom")
-
-        // Resize the image to fit within the new dimensions
-        Imgproc.resize(
-            image,
-            outImage,
-            Size(newUnpadW.toDouble(), newUnpadH.toDouble()),
-            0.0, 0.0,
-            Imgproc.INTER_LINEAR
-        )
-
-        // Apply padding to create letterboxed image
-        Core.copyMakeBorder(
-            outImage,
-            outImage,
-            padTop,
-            padBottom,
-            padLeft,
-            padRight,
-            Core.BORDER_CONSTANT,
-            color
-        )
-    }
-
-    /**
-     * Scale coordinates from model input size to original image size
-     * Fixed vertical positioning issue with letterboxed images
-     */
-    private fun scaleCoords(
-        imageShape: Size,
-        coords: RectF,
-        imageOriginalShape: Size,
-        clip: Boolean = true
-    ): RectF {
-        // Get dimensions in pixels
-        val inputWidth = imageShape.width.toFloat()
-        val inputHeight = imageShape.height.toFloat()
-        val originalWidth = imageOriginalShape.width.toFloat()
-        val originalHeight = imageOriginalShape.height.toFloat()
-
-        // Calculate scaling factor (ratio) between original and input sizes
-        val gain = min(inputWidth / originalWidth, inputHeight / originalHeight)
-
-        // Calculate padding needed for letterboxing
-        val padX = (inputWidth - originalWidth * gain) / 2.0f
-        val padY = (inputHeight - originalHeight * gain) / 2.0f
-
-        // Debug dimensions
-        debug("Scale coords: input=${inputWidth}x${inputHeight}, original=${originalWidth}x${originalHeight}")
-        debug("Scale coords: gain=$gain, padding=($padX, $padY)")
-        debug("Scale coords: input normalized=(${coords.left}, ${coords.top}, ${coords.right}, ${coords.bottom})")
-
-        // Convert normalized coordinates [0-1] to absolute pixel coordinates
-        val absLeft = coords.left * inputWidth
-        val absTop = coords.top * inputHeight
-        val absRight = coords.right * inputWidth
-        val absBottom = coords.bottom * inputHeight
-
-        debug("Scale coords: absolute pixels=($absLeft, $absTop, $absRight, $absBottom)")
-
-        // Remove padding and scale back to original image dimensions
-        val x1 = (absLeft - padX) / gain
-        val y1 = (absTop - padY) / gain
-        val x2 = (absRight - padX) / gain
-        val y2 = (absBottom - padY) / gain
-
-        debug("Scale coords: output original=($x1, $y1, $x2, $y2)")
-
-        // Create result rectangle
-        val result = RectF(x1, y1, x2, y2)
-
-        // Clip to image boundaries if requested
-        if (clip) {
-            result.left = max(0f, min(result.left, originalWidth))
-            result.top = max(0f, min(result.top, originalHeight))
-            result.right = max(0f, min(result.right, originalWidth))
-            result.bottom = max(0f, min(result.bottom, originalHeight))
-        }
-
-        return result
-    }
 
     /**
      * Clamp a value between min and max

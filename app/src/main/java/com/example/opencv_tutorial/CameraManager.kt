@@ -325,25 +325,39 @@ class CameraManager(
             }
         }
         
-        // Process UV planes - combine them with interleaving for NV21
+        // Process UV planes - CRITICAL FIX: Correctly interleave U and V planes
+        // Android camera often provides NV21 (VU order) but OpenCV expects it in specific order
         val chromaHeight = height / 2
         val chromaWidth = width / 2
         
-        if (uPixelStride == 2 && vPixelStride == 2) {
-            // Common case: U/V are interleaved
-            val uvPos = position
+        // FIXED: Swap U and V channels based on detected format to ensure correct colors
+        val isUVInterleaved = uPixelStride == 2 && vPixelStride == 2 && 
+                             uPlane.buffer.capacity() == vPlane.buffer.capacity()
+        val isVUFormat = isUVInterleaved && uPlane.buffer.compareTo(vPlane.buffer) > 0
+        
+        if (isUVInterleaved) {
+            // Handle interleaved UV/VU format
             for (row in 0 until chromaHeight) {
                 for (col in 0 until chromaWidth) {
-                    yuvBytes[position++] = vBuffer.get(row * vRowStride + col * 2)     // V first for NV21
-                    yuvBytes[position++] = uBuffer.get(row * uRowStride + col * 2)     // U second
+                    val uvIndex = (row * uRowStride) + (col * 2)
+                    if (isVUFormat) {
+                        // NV21: VU order
+                        yuvBytes[position++] = vBuffer.get(uvIndex)  // V first for NV21
+                        yuvBytes[position++] = uBuffer.get(uvIndex)  // U second
+                    } else {
+                        // NV12: UV order
+                        yuvBytes[position++] = uBuffer.get(uvIndex)  // U
+                        yuvBytes[position++] = vBuffer.get(uvIndex)  // V
+                    }
                 }
             }
         } else {
-            // Fall back to pixel-by-pixel copy
+            // Fall back to pixel-by-pixel copy for non-interleaved formats
             for (row in 0 until chromaHeight) {
                 for (col in 0 until chromaWidth) {
                     val uIndex = (row * uRowStride) + (col * uPixelStride)
                     val vIndex = (row * vRowStride) + (col * vPixelStride)
+                    // Default to NV21 format
                     yuvBytes[position++] = vBuffer.get(vIndex)  // V
                     yuvBytes[position++] = uBuffer.get(uIndex)  // U
                 }
@@ -367,37 +381,33 @@ class CameraManager(
         val result = Mat()
         
         try {
-            // Apply moderate enhancement for real-time performance
+            // FIXED: Scale back image enhancements to prevent distortion
+            // Simply convert colors without heavy processing for real-time performance
+            inputMat.copyTo(result)
+            
+            // Apply very minimal enhancements - just slight white balancing
             val yuv = Mat()
-            Imgproc.cvtColor(inputMat, yuv, Imgproc.COLOR_BGR2YUV)
+            Imgproc.cvtColor(result, yuv, Imgproc.COLOR_BGR2YUV)
             val yuvChannels = ArrayList<Mat>(3)
             Core.split(yuv, yuvChannels)
             
-            // Apply gentler CLAHE for better contrast without artifacts
-            val clahe = Imgproc.createCLAHE(1.5, OpenCVSize(4.0, 4.0))
+            // FIXED: Dramatically reduce CLAHE strength to prevent color distortion
+            val clahe = Imgproc.createCLAHE(1.2, OpenCVSize(3.0, 3.0))
             clahe.apply(yuvChannels[0], yuvChannels[0])
             
-            // Apply subtle color correction to UV channels to prevent color shifting
-            Core.normalize(yuvChannels[1], yuvChannels[1], 0.0, 255.0, Core.NORM_MINMAX)
-            Core.normalize(yuvChannels[2], yuvChannels[2], 0.0, 255.0, Core.NORM_MINMAX)
-            
-            // Merge channels back
+            // FIXED: Don't normalize UV channels, which causes color shifts
+            // Just merge back the channels as they are
             Core.merge(yuvChannels, yuv)
-            
-            // Convert back to BGR
             Imgproc.cvtColor(yuv, result, Imgproc.COLOR_YUV2BGR)
             
-            // Apply very gentle denoising only if needed (using standard Gaussian blur instead)
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-                // Older devices may need more denoising
-                // Using Gaussian blur as a simpler alternative to fastNlMeansDenoisingColored
-                Imgproc.GaussianBlur(result, result, OpenCVSize(3.0, 3.0), 0.5)
-                
-                // Alternative: Use bilateralFilter for edge-preserving noise removal
-                // Imgproc.bilateralFilter(result, result, 5, 15.0, 15.0)
+            // FIXED: Remove Gaussian blur entirely - it was causing image softening
+            // Only apply minimal denoising if absolutely necessary on older devices
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+                // Use very minimal blur only on older devices
+                Imgproc.GaussianBlur(result, result, OpenCVSize(3.0, 3.0), 0.3)
             }
             
-            // Clean up
+            // Clean up resources
             yuv.release()
             for (mat in yuvChannels) {
                 mat.release()

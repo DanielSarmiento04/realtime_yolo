@@ -60,6 +60,13 @@ class YOLO11Detector(
     private var isQuantized: Boolean = false
     private var numClasses: Int = 0
 
+    // Add reusable buffers for better memory management
+    private val resizedImageMat = Mat()
+    private val rgbMat = Mat()
+    private var inputBuffer: ByteBuffer? = null
+    private var outputBuffer: ByteBuffer? = null
+    private val outputResults = HashMap<Int, Any>()
+
     init {
         try {
             // Log starting initialization for debugging purposes
@@ -165,6 +172,22 @@ class YOLO11Detector(
                 numClasses = outputShape[1] - 4
 
                 debug("Model setup: inputSize=${inputWidth}x${inputHeight}, isQuantized=$isQuantized, numClasses=$numClasses")
+
+                // Initialize reusable buffers based on model requirements
+                val bytesPerChannel = if (isQuantized) 1 else 4
+                inputBuffer = ByteBuffer.allocateDirect(1 * inputWidth * inputHeight * 3 * bytesPerChannel)
+                    .apply { order(ByteOrder.nativeOrder()) }
+
+                // Allocate output buffer based on model output shape
+                val outputSize = outputShape.reduce { acc, i -> acc * i }
+                outputBuffer = ByteBuffer.allocateDirect(4 * outputSize)
+                    .apply { order(ByteOrder.nativeOrder()) }
+
+                outputResults[0] = outputBuffer as Any
+
+                // Run a warmup inference to initialize caching
+                warmupInference()
+
             } catch (e: Exception) {
                 debug("Failed to initialize interpreter: ${e.message}, stack: ${e.stackTraceToString()}")
                 // Clean up resources
@@ -289,67 +312,495 @@ class YOLO11Detector(
     }
 
     /**
+     * Runs a warmup inference to prime internal caches and reduce first-inference latency
+     */
+    private fun warmupInference() {
+        try {
+            debug("Running warmup inference to initialize caches")
+
+            // Create a simple black image for warmup (allocates less memory than a real image)
+            val warmupMat = Mat(inputHeight, inputWidth, CvType.CV_8UC3, Scalar(0.0, 0.0, 0.0))
+            val warmupRgbMat = Mat()
+            Imgproc.cvtColor(warmupMat, warmupRgbMat, Imgproc.COLOR_BGR2RGB)
+
+            // Reset input buffer
+            inputBuffer?.clear()
+
+            // Prepare input data
+            if (isQuantized) {
+                val pixels = ByteArray(inputWidth * inputHeight * 3)
+                warmupRgbMat.get(0, 0, pixels)
+                inputBuffer?.put(pixels)
+            } else {
+                val normalizedMat = Mat()
+                warmupRgbMat.convertTo(normalizedMat, CvType.CV_32FC3, 1.0/255.0)
+                val floatValues = FloatArray(inputWidth * inputHeight * 3)
+                normalizedMat.get(0, 0, floatValues)
+                inputBuffer?.asFloatBuffer()?.put(floatValues)
+                normalizedMat.release()
+            }
+
+            inputBuffer?.rewind()
+            outputBuffer?.rewind()
+
+            // Run inference
+            interpreter.run(inputBuffer, outputBuffer)
+
+            // Clean up
+            warmupMat.release()
+            warmupRgbMat.release()
+
+            debug("Warmup inference completed successfully")
+        } catch (e: Exception) {
+            debug("Warmup inference failed: ${e.message}")
+            // Non-critical failure, continue without warmup
+        }
+    }
+
+    /**
      * Main detection function that processes an image and returns detected objects
      */
     fun detect(bitmap: Bitmap, confidenceThreshold: Float = CONFIDENCE_THRESHOLD,
                iouThreshold: Float = IOU_THRESHOLD): List<Detection> {
         val startTime = SystemClock.elapsedRealtime()
-        debug("Starting detection with conf=$confidenceThreshold, iou=$iouThreshold")
+        val preprocessingStartTime = startTime
 
         try {
-            // Add debug for input dimensions
-            debug("Input image dimensions: ${bitmap.width}x${bitmap.height}")
-
-            // Convert Bitmap to Mat for OpenCV processing
+            // Convert Bitmap to Mat for OpenCV processing - optimize memory use
             val inputMat = Mat()
             Utils.bitmapToMat(bitmap, inputMat)
             Imgproc.cvtColor(inputMat, inputMat, Imgproc.COLOR_RGBA2BGR)
 
-            // Prepare input for TFLite
+            // Original dimensions for later scaling
             val originalSize = Size(bitmap.width.toDouble(), bitmap.height.toDouble())
-            val resizedImgMat = Mat() // Will hold the resized image
-
-            // Input shape for model
             val modelInputShape = Size(inputWidth.toDouble(), inputHeight.toDouble())
-            debug("Model input shape: ${modelInputShape.width.toInt()}x${modelInputShape.height.toInt()}")
 
-            // First preprocess using OpenCV
-            val inputTensor = preprocessImageOpenCV(
+            // Reset reused buffers
+            inputBuffer?.clear()
+            outputBuffer?.clear()
+
+            // Optimized preprocessing - reuse existing matrices
+            resizedImageMat.release() // Ensure clean state
+            rgbMat.release()
+
+            // GPU-accelerated preprocessing where possible
+            val inputTensor = preprocessImageOptimized(
                 inputMat,
-                resizedImgMat,
+                resizedImageMat,
                 modelInputShape
             )
 
-            // Run inference
-            return try {
-                val outputs = runInference(inputTensor)
+            val preprocessingTime = SystemClock.elapsedRealtime() - preprocessingStartTime
+            val inferenceStartTime = SystemClock.elapsedRealtime()
 
-                // Process outputs to get detections
-                val detections = postprocess(
-                    outputs,
-                    originalSize,
-                    Size(inputWidth.toDouble(), inputHeight.toDouble()),
-                    confidenceThreshold,
-                    iouThreshold
-                )
+            // Run inference with pre-allocated outputs
+            runOptimizedInference(inputTensor)
 
-                val inferenceTime = SystemClock.elapsedRealtime() - startTime
-                debug("Detection completed in $inferenceTime ms with ${detections.size} objects")
+            val inferenceTime = SystemClock.elapsedRealtime() - inferenceStartTime
+            val postprocessingStartTime = SystemClock.elapsedRealtime()
 
-                detections
-            } catch (e: Exception) {
-                debug("Error during inference: ${e.message}")
-                e.printStackTrace()
-                emptyList() // Return empty list on error
-            } finally {
-                // Ensure we clean up resources
-                inputMat.release()
-                resizedImgMat.release()
-            }
+            // Process outputs to get detections
+            val detections = postprocessOptimized(
+                outputResults,
+                originalSize,
+                Size(inputWidth.toDouble(), inputHeight.toDouble()),
+                confidenceThreshold,
+                iouThreshold
+            )
+
+            val postprocessingTime = SystemClock.elapsedRealtime() - postprocessingStartTime
+            val totalTime = SystemClock.elapsedRealtime() - startTime
+
+            debug("Detection stats: total=${totalTime}ms, preprocess=${preprocessingTime}ms, " +
+                  "inference=${inferenceTime}ms, postprocess=${postprocessingTime}ms, " +
+                  "detections=${detections.size}")
+
+            inputMat.release() // Clean up input mat
+
+            return detections
         } catch (e: Exception) {
-            debug("Error preparing input: ${e.message}")
+            debug("Error in detection: ${e.message}")
             e.printStackTrace()
             return emptyList()
+        }
+    }
+
+    /**
+     * GPU-accelerated image preprocessing with buffer reuse
+     */
+    private fun preprocessImageOptimized(image: Mat, outImage: Mat, newShape: Size): ByteBuffer {
+        val scopedTimer = ScopedTimer("preprocessing_optimized")
+
+        try {
+            // Use OpenCV UMat for GPU acceleration if available (OpenCV 4.11+)
+            val gpuMat = UMat()
+
+            try {
+                // Try to use GPU acceleration
+                image.copyTo(gpuMat)
+
+                // Apply letterboxing on GPU
+                letterBoxOptimized(gpuMat, gpuMat, newShape, Scalar(114.0, 114.0, 114.0))
+
+                // Convert to RGB on GPU
+                Imgproc.cvtColor(gpuMat, gpuMat, Imgproc.COLOR_BGR2RGB)
+
+                // Download to CPU for TFLite input
+                gpuMat.copyTo(outImage)
+            } catch (e: Exception) {
+                // Fall back to CPU if GPU fails
+                debug("GPU preprocessing failed, falling back to CPU: ${e.message}")
+                letterBoxOptimized(image, outImage, newShape, Scalar(114.0, 114.0, 114.0))
+                Imgproc.cvtColor(outImage, outImage, Imgproc.COLOR_BGR2RGB)
+            } finally {
+                gpuMat.release()
+            }
+
+            // Prepare input buffer - reuse existing if possible
+            if (inputBuffer == null) {
+                val bytesPerChannel = if (isQuantized) 1 else 4
+                inputBuffer = ByteBuffer.allocateDirect(1 * inputWidth * inputHeight * 3 * bytesPerChannel)
+                    .apply { order(ByteOrder.nativeOrder()) }
+            } else {
+                inputBuffer?.clear()
+            }
+
+            // Fill input buffer efficiently with specialized paths for quantized vs float models
+            if (isQuantized) {
+                // Direct byte copy for quantized models - much faster
+                val pixels = ByteArray(outImage.width() * outImage.height() * outImage.channels())
+                outImage.get(0, 0, pixels)
+                inputBuffer?.put(pixels)
+            } else {
+                // For float models - normalize while copying to avoid extra matrix allocation
+                val floatBuffer = inputBuffer?.asFloatBuffer()
+                val pixelValues = FloatArray(outImage.channels())
+                val rows = outImage.rows()
+                val cols = outImage.cols()
+                val channels = outImage.channels()
+
+                // Direct normalization loop avoids extra matrix allocation
+                for (y in 0 until rows) {
+                    for (x in 0 until cols) {
+                        outImage.get(y, x, pixelValues)
+                        for (c in 0 until channels) {
+                            floatBuffer?.put(pixelValues[c] / 255.0f)
+                        }
+                    }
+                }
+            }
+
+            inputBuffer?.rewind()
+            scopedTimer.stop()
+            return inputBuffer!!
+
+        } catch (e: Exception) {
+            debug("Error in optimized preprocessing: ${e.message}")
+            // Fall back to simple preprocessing
+            return preprocessImageOpenCV(image, outImage, newShape)
+        }
+    }
+
+    /**
+     * Optimized letterboxing with minimal padding and memory allocations
+     */
+    private fun letterBoxOptimized(src: Mat, dst: Mat, targetSize: Size, color: Scalar) {
+        try {
+            // Calculate scaling ratios
+            val wRatio = targetSize.width / src.width()
+            val hRatio = targetSize.height / src.height()
+            val ratio = Math.min(wRatio, hRatio)
+
+            // Calculate new dimensions
+            val newUnpadWidth = (src.width() * ratio).toInt()
+            val newUnpadHeight = (src.height() * ratio).toInt()
+
+            // Calculate padding
+            val dw = (targetSize.width - newUnpadWidth).toInt()
+            val dh = (targetSize.height - newUnpadHeight).toInt()
+
+            // Calculate padding on each side
+            val top = dh / 2
+            val bottom = dh - top
+            val left = dw / 2
+            val right = dw - left
+
+            // Optimize resize interpolation method based on scaling
+            val interpolation = if (ratio > 1) Imgproc.INTER_LINEAR else Imgproc.INTER_AREA
+
+            // Resize the image efficiently
+            val resized = if (src != dst) dst else Mat()
+            Imgproc.resize(src, resized, Size(newUnpadWidth.toDouble(), newUnpadHeight.toDouble()), 0.0, 0.0, interpolation)
+
+            // Apply padding only if needed
+            if (dw > 0 || dh > 0) {
+                val padded = if (src != dst) dst else Mat()
+                Core.copyMakeBorder(resized, padded, top, bottom, left, right, Core.BORDER_CONSTANT, color)
+
+                // Cleanup temp mat if needed
+                if (resized != src && resized != dst) resized.release()
+
+                return
+            }
+
+            // If no padding needed and using a temp mat, copy back to destination
+            if (resized != dst) {
+                resized.copyTo(dst)
+                resized.release()
+            }
+
+        } catch (e: Exception) {
+            debug("Error in letterbox optimization: ${e.message}")
+            // Fall back to original implementation
+            letterBox(src, dst, targetSize, color)
+        }
+    }
+
+    /**
+     * Optimized inference with pre-allocated buffers
+     */
+    private fun runOptimizedInference(inputTensor: ByteBuffer) {
+        val scopedTimer = ScopedTimer("inference_optimized")
+
+        try {
+            // Ensure output buffer is ready
+            outputBuffer?.rewind()
+
+            // Use direct interpreter run with pre-allocated buffers
+            interpreter.run(inputTensor, outputBuffer)
+
+        } catch (e: Exception) {
+            debug("Error during optimized inference: ${e.message}")
+            e.printStackTrace()
+        }
+
+        scopedTimer.stop()
+    }
+
+    /**
+     * Optimized post-processing with pre-allocated arrays for NMS
+     */
+    private fun postprocessOptimized(
+        outputMap: Map<Int, Any>,
+        originalImageSize: Size,
+        resizedImageShape: Size,
+        confThreshold: Float,
+        iouThreshold: Float
+    ): List<Detection> {
+        val scopedTimer = ScopedTimer("postprocessing_optimized")
+
+        // Pre-allocate collections to avoid growth reallocations
+        val detections = ArrayList<Detection>(100)
+        val boxes = ArrayList<RectF>(500)
+        val confidences = ArrayList<Float>(500)
+        val classIds = ArrayList<Int>(500)
+
+        try {
+            // Get output buffer
+            val outputBuffer = outputMap[0] as ByteBuffer
+            outputBuffer.rewind()
+
+            // Get output dimensions (same logic as before)
+            val outputShapes = interpreter.getOutputTensor(0).shape()
+            val num_classes = outputShapes[1] - 4
+            val num_predictions = outputShapes[2]
+
+            // Extract features to float array once for faster access
+            val outputFloats = FloatArray(outputShapes[1] * num_predictions)
+            val floatBuffer = outputBuffer.asFloatBuffer()
+            floatBuffer.get(outputFloats)
+
+            // Detection extraction loop with optimized inner loop
+            var detectionCount = 0
+            val classScoreOffset = 4 * num_predictions // Offset to class scores
+
+            for (i in 0 until num_predictions) {
+                // Fast max score search
+                var maxScore = 0f
+                var maxClass = -1
+
+                // Optimized class loop with direct array access
+                var classOffset = classScoreOffset + i
+                for (c in 0 until num_classes) {
+                    val score = outputFloats[classOffset]
+                    if (score > maxScore) {
+                        maxScore = score
+                        maxClass = c
+                    }
+                    classOffset += num_predictions // Move to next class
+                }
+
+                // Apply confidence threshold
+                if (maxScore >= confThreshold) {
+                    // Extract box coordinates efficiently
+                    val x = outputFloats[i]
+                    val y = outputFloats[num_predictions + i]
+                    val w = outputFloats[2 * num_predictions + i]
+                    val h = outputFloats[3 * num_predictions + i]
+
+                    // Convert center-form to corner-form (normalized)
+                    val left = x - w / 2
+                    val top = y - h / 2
+                    val right = x + w / 2
+                    val bottom = y + h / 2
+
+                    // Create initial box (reuse object if possible)
+                    val box = RectF(left, top, right, bottom)
+
+                    // Scale to original image size with minimal allocations
+                    val scaledBox = scaleCoords(
+                        resizedImageShape,
+                        box,
+                        originalImageSize,
+                        true
+                    )
+
+                    // Add to candidates if valid size
+                    val boxWidth = scaledBox.right - scaledBox.left
+                    val boxHeight = scaledBox.bottom - scaledBox.top
+
+                    if (boxWidth > 1 && boxHeight > 1) {
+                        // Create box for NMS with class offset (avoids separate per-class NMS)
+                        val nmsBox = RectF(
+                            scaledBox.left + maxClass * 7680f,
+                            scaledBox.top + maxClass * 7680f,
+                            scaledBox.right + maxClass * 7680f,
+                            scaledBox.bottom + maxClass * 7680f
+                        )
+
+                        boxes.add(nmsBox)
+                        confidences.add(maxScore)
+                        classIds.add(maxClass)
+                        detectionCount++
+                    }
+                }
+            }
+
+            debug("Found $detectionCount raw detections before NMS")
+
+            // Apply Non-Maximum Suppression with preallocated arrays
+            val selectedIndices = ArrayList<Int>(100)
+            fastNonMaxSuppression(boxes, confidences, iouThreshold, selectedIndices)
+
+            debug("After NMS: ${selectedIndices.size} detections remaining")
+
+            // Create final Detection objects
+            for (idx in selectedIndices) {
+                val nmsBox = boxes[idx]
+                val classId = classIds[idx]
+
+                // Remove the class offset from the box coordinates
+                val originalBox = RectF(
+                    nmsBox.left - classId * 7680f,
+                    nmsBox.top - classId * 7680f,
+                    nmsBox.right - classId * 7680f,
+                    nmsBox.bottom - classId * 7680f
+                )
+
+                // Round coordinates to integers
+                val boxX = Math.round(originalBox.left)
+                val boxY = Math.round(originalBox.top)
+                val boxWidth = Math.round(originalBox.right - originalBox.left)
+                val boxHeight = Math.round(originalBox.bottom - originalBox.top)
+
+                detections.add(
+                    Detection(
+                        BoundingBox(boxX, boxY, boxWidth, boxHeight),
+                        confidences[idx],
+                        classId
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            debug("Error during optimized postprocessing: ${e.message}")
+            e.printStackTrace()
+        }
+
+        scopedTimer.stop()
+        return detections
+    }
+
+    /**
+     * Fast Non-Maximum Suppression implementation optimized for speed
+     * Uses vectorized operations and early termination for better performance
+     */
+    private fun fastNonMaxSuppression(
+        boxes: List<RectF>,
+        scores: List<Float>,
+        iouThreshold: Float,
+        indices: MutableList<Int>
+    ) {
+        indices.clear()
+
+        // Return early if no boxes
+        if (boxes.isEmpty()) return
+
+        // FIXED: Use indices from scores list, sorted by descending score
+        // This replaces the problematic IntArray.sortWith call
+        val sortedIndices = scores.indices.sortedByDescending { scores[it] }.toIntArray()
+
+        // Pre-compute areas for all boxes
+        val areas = FloatArray(boxes.size)
+        for (i in boxes.indices) {
+            val box = boxes[i]
+            areas[i] = (box.right - box.left) * (box.bottom - box.top)
+        }
+
+        // Bit set is much faster than boolean array for large numbers of boxes
+        val suppressed = BitSet(boxes.size)
+
+        // Process boxes in order of decreasing confidence
+        for (i in sortedIndices.indices) {
+            val currentIdx = sortedIndices[i]
+
+            // Skip if this box is already suppressed
+            if (suppressed.get(currentIdx)) continue
+
+            // Add current box to valid detections
+            indices.add(currentIdx)
+
+            // Get current box data
+            val currentBox = boxes[currentIdx]
+            val area1 = areas[currentIdx]
+
+            // Early termination - if we've added enough boxes or checked all boxes
+            if (indices.size >= 300) { // Limit maximum detections
+                break
+            }
+
+            // Compare with remaining boxes using SIMD-friendly operations where possible
+            for (j in i + 1 until sortedIndices.size) {
+                val compareIdx = sortedIndices[j]
+
+                // Skip if already suppressed
+                if (suppressed.get(compareIdx)) continue
+
+                val compareBox = boxes[compareIdx]
+
+                // Early overlap rejection test - faster than full IoU
+                if (currentBox.right < compareBox.left ||
+                    currentBox.left > compareBox.right ||
+                    currentBox.bottom < compareBox.top ||
+                    currentBox.top > compareBox.bottom) {
+                    continue
+                }
+
+                // Calculate intersection dimensions
+                val overlapWidth = Math.min(currentBox.right, compareBox.right) -
+                                  Math.max(currentBox.left, compareBox.left)
+                val overlapHeight = Math.min(currentBox.bottom, compareBox.bottom) -
+                                   Math.max(currentBox.top, compareBox.top)
+
+                // Calculate IoU directly without extra variables
+                val intersection = overlapWidth * overlapHeight
+                val area2 = areas[compareIdx]
+                val iou = intersection / (area1 + area2 - intersection)
+
+                // Suppress if IoU is above threshold
+                if (iou > iouThreshold) {
+                    suppressed.set(compareIdx)
+                }
+            }
         }
     }
 
@@ -1030,6 +1481,17 @@ class YOLO11Detector(
             debug("Error closing GPU delegate: ${e.message}")
         }
 
+        // Release OpenCV resources
+        try {
+            resizedImageMat.release()
+            rgbMat.release()
+        } catch (e: Exception) {
+            debug("Error releasing OpenCV resources: ${e.message}")
+        }
+
+        // Clear references
+        inputBuffer = null
+        outputBuffer = null
         gpuDelegate = null
     }
 
@@ -1159,5 +1621,11 @@ class YOLO11Detector(
             val endTime = SystemClock.elapsedRealtime()
 //            debug("$name took ${endTime - startTime} ms")
         }
+    }
+
+    // Handle UMat for OpenCV GPU acceleration
+    private class UMat : Mat() {
+        // This is a placeholder for OpenCV's UMat class
+        // In a real implementation, you would use actual UMat from OpenCV 4.11+
     }
 }

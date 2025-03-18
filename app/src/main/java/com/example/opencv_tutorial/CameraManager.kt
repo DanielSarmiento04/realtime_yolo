@@ -62,6 +62,9 @@ class CameraManager(
         private const val MAX_SKIP_FRAMES = 2 // Skip at most 2 frames when busy
     }
 
+    // Track the current rotation
+    private var currentRotation = 0
+
     /**
      * Start camera preview and analysis
      */
@@ -170,6 +173,10 @@ class CameraManager(
 
         isProcessing = true
         val startTime = System.currentTimeMillis()
+        
+        // Store rotation value for coordinate transformation
+        val imageRotation = image.imageInfo.rotationDegrees
+        currentRotation = imageRotation
 
         // Convert image to bitmap in IO dispatcher
         processingScope.launch {
@@ -178,7 +185,7 @@ class CameraManager(
                 val bitmap = image.toBitmap()
                 
                 // Reorient bitmap if needed - use the more efficient rotateBitmapIfNeeded
-                val rotatedBitmap = rotateBitmapIfNeeded(bitmap, image.imageInfo.rotationDegrees)
+                val rotatedBitmap = rotateBitmapIfNeeded(bitmap, imageRotation)
                 
                 // Get detector instance from the parent activity
                 val detector = YOLODetectorProvider.getDetector(context)
@@ -186,6 +193,13 @@ class CameraManager(
                 if (detector != null) {
                     // Run detection with high-quality preprocessed image
                     val detections = detector.detect(rotatedBitmap)
+                    
+                    // Apply rotation correction to detection coordinates
+                    val correctedDetections = if (imageRotation != 0) {
+                        transformDetectionCoordinates(detections, rotatedBitmap.width, rotatedBitmap.height, imageRotation)
+                    } else {
+                        detections
+                    }
                     
                     // Track performance
                     val processingTime = System.currentTimeMillis() - startTime
@@ -196,12 +210,12 @@ class CameraManager(
                         val avgFps = 1000.0 / performanceTracker.getAverageProcessingTime()
                         Log.d(TAG, "Avg processing time: ${performanceTracker.getAverageProcessingTime()}ms, " +
                                 "FPS: ${"%.1f".format(avgFps)}, " +
-                                "Detections: ${detections.size}")
+                                "Detections: ${correctedDetections.size}")
                     }
                     
-                    // Notify UI on main thread
+                    // Notify UI on main thread with corrected detections
                     withContext(Dispatchers.Main) {
-                        onFrameProcessed?.invoke(rotatedBitmap, detections, processingTime)
+                        onFrameProcessed?.invoke(rotatedBitmap, correctedDetections, processingTime)
                     }
                 }
                 
@@ -217,6 +231,68 @@ class CameraManager(
                 image.close()
                 isProcessing = false
             }
+        }
+    }
+
+    /**
+     * Transform detection coordinates based on rotation
+     */
+    private fun transformDetectionCoordinates(
+        detections: List<YOLO11Detector.Detection>,
+        width: Int,
+        height: Int,
+        rotation: Int
+    ): List<YOLO11Detector.Detection> {
+        return detections.map { detection ->
+            val correctedRect = when (rotation) {
+                90 -> {
+                    // When rotated 90 degrees: (x,y) becomes (y, width-x)
+                    org.opencv.core.Rect(
+                        detection.box.y,
+                        width - detection.box.x - detection.box.width,
+                        detection.box.height,
+                        detection.box.width
+                    )
+                }
+                180 -> {
+                    // When rotated 180 degrees: (x,y) becomes (width-x-w, height-y-h)
+                    org.opencv.core.Rect(
+                        width - detection.box.x - detection.box.width,
+                        height - detection.box.y - detection.box.height,
+                        detection.box.width,
+                        detection.box.height
+                    )
+                }
+                270 -> {
+                    // When rotated 270 degrees: (x,y) becomes (height-y-h, x)
+                    org.opencv.core.Rect(
+                        height - detection.box.y - detection.box.height,
+                        detection.box.x,
+                        detection.box.height,
+                        detection.box.width
+                    )
+                }
+                else -> null // No rotation (0 degrees)
+            }
+            
+            // Convert OpenCV Rect to YOLO11Detector.BoundingBox or use original
+            val correctedBox = if (correctedRect != null) {
+                YOLO11Detector.BoundingBox(
+                    x = correctedRect.x,
+                    y = correctedRect.y,
+                    width = correctedRect.width,
+                    height = correctedRect.height
+                )
+            } else {
+                detection.box
+            }
+            
+            // Create a new detection with corrected coordinates
+            YOLO11Detector.Detection(
+                classId = detection.classId,
+                conf = detection.conf,
+                box = correctedBox
+            )
         }
     }
 
@@ -502,6 +578,42 @@ class CameraManager(
                 Log.e(TAG, "Failed to update resolution: ${e.message}")
             }
         }, ContextCompat.getMainExecutor(context))
+    }
+    
+    /**
+     * Handle device orientation changes
+     * @param orientation The new orientation from Configuration.orientation
+     */
+    fun handleOrientationChange(orientation: Int) {
+        try {
+            // Log the orientation change
+            Log.d(TAG, "Orientation changed: $orientation")
+            
+            // Get the current display rotation
+            val rotation = when {
+                context is android.app.Activity -> context.windowManager.defaultDisplay.rotation
+                android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R -> 
+                    context.display?.rotation ?: android.view.Surface.ROTATION_0
+                else -> android.view.Surface.ROTATION_0
+            }
+            
+            // If needed, update the camera preview rotation
+            camera?.let { cam ->
+                // We don't need to rebind use cases for orientation changes since CameraX handles this,
+                // but we do need to keep track for our detection transformations
+                currentRotation = when (rotation) {
+                    android.view.Surface.ROTATION_0 -> 0
+                    android.view.Surface.ROTATION_90 -> 90
+                    android.view.Surface.ROTATION_180 -> 180
+                    android.view.Surface.ROTATION_270 -> 270
+                    else -> 0
+                }
+                
+                Log.d(TAG, "Updated current rotation: $currentRotation")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error handling orientation change: ${e.message}")
+        }
     }
     
     /**

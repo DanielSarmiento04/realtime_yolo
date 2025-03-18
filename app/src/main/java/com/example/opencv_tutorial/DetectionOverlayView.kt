@@ -44,11 +44,15 @@ class DetectionOverlayView @JvmOverloads constructor(
 
     private val backgroundPaint = Paint().apply {
         style = Paint.Style.FILL
+        // Set default alpha to avoid unexpected behavior
+        alpha = 180
     }
 
     // Drawing configuration
     enum class BoxStyle {
-        STROKE, FILLED, CORNERS
+        STROKE,      // Simple stroke rectangle
+        FILLED,      // Renamed internally but keeping enum name for compatibility
+        CORNERS      // Corner lines only
     }
 
     // Color palette for different classes
@@ -167,7 +171,7 @@ class DetectionOverlayView @JvmOverloads constructor(
      */
     private fun drawDetection(canvas: Canvas, detection: YOLO11Detector.Detection) {
         // Get color for this class
-        val color = colors[detection.classId % colors.size]
+        var color = colors[detection.classId % colors.size]
         boxPaint.color = color
         backgroundPaint.color = color
         
@@ -180,27 +184,17 @@ class DetectionOverlayView @JvmOverloads constructor(
         // Draw box based on style
         when (boxStyle) {
             BoxStyle.STROKE -> {
-                // Simple rectangle
+                // Simple rectangle - just stroke
+                boxPaint.style = Paint.Style.STROKE
                 canvas.drawRect(left, top, right, bottom, boxPaint)
             }
             BoxStyle.FILLED -> {
-                // Semi-transparent fill with stroke
-                // Store original style in a temporary variable
-                val originalPaintStyle = boxPaint.style
-                
-                // Set stroke style for drawing the border
+                // FIXED: Draw border only, no fill
+                // This preserves the original "FILLED" enum value but doesn't actually fill
                 boxPaint.style = Paint.Style.STROKE
+                boxPaint.strokeWidth = boxThickness * 1.5f  // Make slightly thicker to stand out
                 canvas.drawRect(left, top, right, bottom, boxPaint)
-                
-                // Draw semi-transparent fill
-                val fillPaint = Paint().apply {
-                    style = Paint.Style.FILL
-
-                }
-                canvas.drawRect(left, top, right, bottom, fillPaint)
-                
-                // Restore original style
-                boxPaint.style = originalPaintStyle
+                boxPaint.strokeWidth = boxThickness  // Reset to original thickness
             }
             BoxStyle.CORNERS -> {
                 // Draw corner lines

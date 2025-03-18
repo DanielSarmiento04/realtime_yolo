@@ -98,6 +98,9 @@ class CameraActivity : AppCompatActivity() {
                 this, arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA_PERMISSION
             )
         }
+
+        // Force screen to stay in portrait mode for consistent detection
+        requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
     }
 
     private fun startCamera() {
@@ -213,6 +216,15 @@ class CameraActivity : AppCompatActivity() {
     // Expose camera manager for settings dialog
     fun getCameraManager(): CameraManager? {
         return if (::cameraManager.isInitialized) cameraManager else null
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Notify camera manager of configuration changes
+        if (::cameraManager.isInitialized) {
+            // Allow the camera manager to adjust to orientation changes
+            cameraManager.handleOrientationChange(newConfig.orientation)
+        }
     }
 
     /**

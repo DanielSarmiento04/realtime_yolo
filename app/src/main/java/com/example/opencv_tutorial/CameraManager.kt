@@ -2,8 +2,10 @@ package com.example.opencv_tutorial
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.media.Image
 import android.os.Build
 import android.util.Log
 import android.util.Size
@@ -174,9 +176,14 @@ class CameraManager(
         isProcessing = true
         val startTime = System.currentTimeMillis()
         
-        // Store rotation value for coordinate transformation
+        // Get the image rotation from camera
         val imageRotation = image.imageInfo.rotationDegrees
+        
+        // Store rotation for coordinate transformation and logging
         currentRotation = imageRotation
+        
+        // Log rotation values for debugging
+        Log.d(TAG, "Processing image with rotation: $imageRotation, image dimensions: ${image.width}x${image.height}")
 
         // Convert image to bitmap in IO dispatcher
         processingScope.launch {
@@ -184,8 +191,11 @@ class CameraManager(
                 // Get bitmap from image proxy (efficient conversion)
                 val bitmap = image.toBitmap()
                 
-                // Reorient bitmap if needed - use the more efficient rotateBitmapIfNeeded
+                // Reorient bitmap if needed based on device orientation and camera facing
                 val rotatedBitmap = rotateBitmapIfNeeded(bitmap, imageRotation)
+                
+                // Log the size of rotated bitmap
+                Log.d(TAG, "Rotated bitmap dimensions: ${rotatedBitmap.width}x${rotatedBitmap.height}")
                 
                 // Get detector instance from the parent activity
                 val detector = YOLODetectorProvider.getDetector(context)
@@ -195,11 +205,12 @@ class CameraManager(
                     val detections = detector.detect(rotatedBitmap)
                     
                     // Apply rotation correction to detection coordinates
-                    val correctedDetections = if (imageRotation != 0) {
-                        transformDetectionCoordinates(detections, rotatedBitmap.width, rotatedBitmap.height, imageRotation)
-                    } else {
-                        detections
-                    }
+                    val correctedDetections = transformDetectionsBasedOnOrientation(
+                        detections, 
+                        rotatedBitmap.width, 
+                        rotatedBitmap.height, 
+                        imageRotation
+                    )
                     
                     // Track performance
                     val processingTime = System.currentTimeMillis() - startTime
@@ -235,120 +246,67 @@ class CameraManager(
     }
 
     /**
-     * Transform detection coordinates based on rotation
+     * Extension function to convert ImageProxy to Bitmap
      */
-    private fun transformDetectionCoordinates(
-        detections: List<YOLO11Detector.Detection>,
-        width: Int,
-        height: Int,
-        rotation: Int
-    ): List<YOLO11Detector.Detection> {
-        return detections.map { detection ->
-            val correctedRect = when (rotation) {
-                90 -> {
-                    // When rotated 90 degrees: (x,y) becomes (y, width-x)
-                    org.opencv.core.Rect(
-                        detection.box.y,
-                        width - detection.box.x - detection.box.width,
-                        detection.box.height,
-                        detection.box.width
-                    )
+    private suspend fun ImageProxy.toBitmap(): Bitmap = withContext(Dispatchers.IO) {
+        val buffer = planes[0].buffer
+        val pixelStride = planes[0].pixelStride
+        val rowStride = planes[0].rowStride
+        val rowPadding = rowStride - pixelStride * width
+        
+        // Create bitmap with correct dimensions
+        val bitmap = Bitmap.createBitmap(
+            width + rowPadding / pixelStride,
+            height,
+            Bitmap.Config.ARGB_8888
+        )
+        
+        // Copy the data to the bitmap
+        buffer.rewind()
+        bitmap.copyPixelsFromBuffer(buffer)
+        
+        // If the format is not ARGB_8888, we need to convert using OpenCV
+        // Note: Changed from RGBA_8888 to checking if format is YUV_420_888 or other
+        if (format == ImageFormat.YUV_420_888 || format == ImageFormat.JPEG) {
+            try {
+                val imageMat = Mat()
+                Utils.bitmapToMat(bitmap, imageMat)
+                
+                // Convert based on the format
+                val rgbaMat = Mat()
+                when (format) {
+                    ImageFormat.YUV_420_888 -> {
+                        // For YUV format, use the more comprehensive method
+                        val yuvMat = imageToYuvMat(this@toBitmap)
+                        Imgproc.cvtColor(yuvMat, rgbaMat, Imgproc.COLOR_YUV2RGBA_NV21)
+                        yuvMat.release()
+                    }
+                    ImageFormat.JPEG -> {
+                        Imgproc.cvtColor(imageMat, rgbaMat, Imgproc.COLOR_BGR2RGBA)
+                    }
+                    else -> {
+                        // For other formats, try a simple BGR to RGBA conversion
+                        Imgproc.cvtColor(imageMat, rgbaMat, Imgproc.COLOR_BGR2RGBA)
+                    }
                 }
-                180 -> {
-                    // When rotated 180 degrees: (x,y) becomes (width-x-w, height-y-h)
-                    org.opencv.core.Rect(
-                        width - detection.box.x - detection.box.width,
-                        height - detection.box.y - detection.box.height,
-                        detection.box.width,
-                        detection.box.height
-                    )
-                }
-                270 -> {
-                    // When rotated 270 degrees: (x,y) becomes (height-y-h, x)
-                    org.opencv.core.Rect(
-                        height - detection.box.y - detection.box.height,
-                        detection.box.x,
-                        detection.box.height,
-                        detection.box.width
-                    )
-                }
-                else -> null // No rotation (0 degrees)
+                
+                // Convert back to bitmap
+                val resultBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(rgbaMat, resultBitmap)
+                
+                // Clean up
+                imageMat.release()
+                rgbaMat.release()
+                bitmap.recycle()
+                
+                return@withContext resultBitmap
+            } catch (e: Exception) {
+                Log.e(TAG, "Error converting image format: ${e.message}")
+                // Fall through to return original bitmap if conversion fails
             }
-            
-            // Convert OpenCV Rect to YOLO11Detector.BoundingBox or use original
-            val correctedBox = if (correctedRect != null) {
-                YOLO11Detector.BoundingBox(
-                    x = correctedRect.x,
-                    y = correctedRect.y,
-                    width = correctedRect.width,
-                    height = correctedRect.height
-                )
-            } else {
-                detection.box
-            }
-            
-            // Create a new detection with corrected coordinates
-            YOLO11Detector.Detection(
-                classId = detection.classId,
-                conf = detection.conf,
-                box = correctedBox
-            )
         }
-    }
-
-    /**
-     * Efficiently convert ImageProxy to Bitmap using OpenCV for better performance
-     */
-    private suspend fun ImageProxy.toBitmap(): Bitmap = withContext(Dispatchers.Default) {
-        try {
-            val startTime = System.currentTimeMillis()
-            
-            // Use direct YUV to RGB conversion using ImageProxy planes
-            val yuvMat = imageToYuvMat(this@toBitmap)
-            
-            // Convert YUV to RGB - detect format and use appropriate conversion
-            val rgbMat = Mat()
-            
-            // CameraX in Android typically uses NV21 or YUV_420_888, which OpenCV processes differently
-            if (format == ImageFormat.YUV_420_888) {
-                Imgproc.cvtColor(yuvMat, rgbMat, Imgproc.COLOR_YUV2BGR_NV21)
-            } else {
-                // Fallback path for other formats
-                Imgproc.cvtColor(yuvMat, rgbMat, Imgproc.COLOR_YUV2BGR_NV21)
-            }
-            
-            // Apply moderate image enhancement suitable for real-time
-            val enhancedRgbMat = enhanceImageQuality(rgbMat)
-            
-            // Reuse bitmap when possible to reduce allocations
-            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-            
-            // Convert Mat to Bitmap efficiently
-            Utils.matToBitmap(enhancedRgbMat, bitmap)
-            
-            // Release Mats immediately to prevent memory leaks
-            yuvMat.release()
-            rgbMat.release()
-            if (enhancedRgbMat !== rgbMat) {
-                enhancedRgbMat.release()
-            }
-            
-            val duration = System.currentTimeMillis() - startTime
-            if (duration > 20) { // Only log slow conversions
-                Log.d(TAG, "Image conversion took $duration ms")
-            }
-            
-            bitmap
-        } catch (e: Exception) {
-            Log.e(TAG, "Error converting image: ${e.message}")
-            // Fallback with simpler but potentially lower quality approach
-            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-            val canvas = android.graphics.Canvas(bitmap)
-            val paint = android.graphics.Paint()
-            paint.color = android.graphics.Color.BLACK
-            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
-            bitmap
-        }
+        
+        return@withContext bitmap
     }
 
     /**
@@ -401,12 +359,11 @@ class CameraManager(
             }
         }
         
-        // Process UV planes - CRITICAL FIX: Correctly interleave U and V planes
-        // Android camera often provides NV21 (VU order) but OpenCV expects it in specific order
+        // Process UV planes - correctly interleave U and V planes
         val chromaHeight = height / 2
         val chromaWidth = width / 2
         
-        // FIXED: Swap U and V channels based on detected format to ensure correct colors
+        // Check if UV channels are interleaved
         val isUVInterleaved = uPixelStride == 2 && vPixelStride == 2 && 
                              uPlane.buffer.capacity() == vPlane.buffer.capacity()
         val isVUFormat = isUVInterleaved && uPlane.buffer.compareTo(vPlane.buffer) > 0
@@ -447,71 +404,176 @@ class CameraManager(
         val yuv420sp = yuvMat.reshape(1, height + height/2)
         return yuv420sp
     }
-    
+
     /**
-     * Apply image enhancements to improve visual quality
-     * Includes auto white balance, contrast enhancement,
-     * and noise reduction optimized for real-time processing
+     * Alternative image conversion implementation for different image formats
+     * This handles YUV_420_888 format which is common in CameraX
      */
-    private fun enhanceImageQuality(inputMat: Mat): Mat {
-        val result = Mat()
+    private suspend fun ImageProxy.toArgb8888Bitmap(): Bitmap = withContext(Dispatchers.IO) {
+        val image = this@toArgb8888Bitmap
+        val planes = image.planes
         
-        try {
-            // FIXED: Scale back image enhancements to prevent distortion
-            // Simply convert colors without heavy processing for real-time performance
-            inputMat.copyTo(result)
+        val yBuffer = planes[0].buffer
+        val uBuffer = planes[1].buffer
+        val vBuffer = planes[2].buffer
+        
+        val ySize = yBuffer.remaining()
+        val uSize = uBuffer.remaining()
+        val vSize = vBuffer.remaining()
+        
+        val nv21 = ByteArray(ySize + uSize + vSize)
+        
+        // Copy Y plane
+        yBuffer.get(nv21, 0, ySize)
+        
+        // Interleave U and V planes
+        // This handles the fact that U and V planes in YUV_420_888 can have different strides
+        val uvStride = planes[1].rowStride
+        val uvWidth = width / 2
+        val uvHeight = height / 2
+        
+        var uvPos = 0
+        val uvBufferPos = uvStride * uvHeight - uvWidth // Position the buffer at the last row
+        
+        for (row in uvHeight - 1 downTo 0) {
+            for (col in 0 until uvWidth) {
+                val bufferIndex = uvBufferPos + (row * uvStride) + col
+                nv21[ySize + uvPos + 0] = vBuffer.get(bufferIndex)      // V
+                nv21[ySize + uvPos + 1] = uBuffer.get(bufferIndex)      // U
+                uvPos += 2
+            }
+        }
+        
+        // Convert NV21 to Bitmap
+        val yuvImage = android.graphics.YuvImage(
+            nv21, 
+            android.graphics.ImageFormat.NV21,
+            width, height, null
+        )
+        
+        val out = java.io.ByteArrayOutputStream()
+        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
+        val imageBytes = out.toByteArray()
+        
+        return@withContext BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+    }
+
+    /**
+     * Enhanced transformation of detection coordinates based on orientation
+     */
+    private fun transformDetectionsBasedOnOrientation(
+        detections: List<YOLO11Detector.Detection>,
+        width: Int,
+        height: Int,
+        rotation: Int
+    ): List<YOLO11Detector.Detection> {
+        // Log input parameters for debugging
+        Log.d(TAG, "Transforming detections: width=$width, height=$height, rotation=$rotation")
+        Log.d(TAG, "Camera facing: ${if (lensFacing == CameraSelector.LENS_FACING_FRONT) "FRONT" else "BACK"}")
+        
+        // Determine if we need to flip coordinates for front camera
+        val isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
+        
+        return detections.map { detection ->
+            // Log original detection coordinates
+            Log.d(TAG, "Original detection: x=${detection.box.x}, y=${detection.box.y}, " +
+                     "w=${detection.box.width}, h=${detection.box.height}")
             
-            // Apply very minimal enhancements - just slight white balancing
-            val yuv = Mat()
-            Imgproc.cvtColor(result, yuv, Imgproc.COLOR_BGR2YUV)
-            val yuvChannels = ArrayList<Mat>(3)
-            Core.split(yuv, yuvChannels)
-            
-            // FIXED: Dramatically reduce CLAHE strength to prevent color distortion
-            val clahe = Imgproc.createCLAHE(1.2, OpenCVSize(3.0, 3.0))
-            clahe.apply(yuvChannels[0], yuvChannels[0])
-            
-            // FIXED: Don't normalize UV channels, which causes color shifts
-            // Just merge back the channels as they are
-            Core.merge(yuvChannels, yuv)
-            Imgproc.cvtColor(yuv, result, Imgproc.COLOR_YUV2BGR)
-            
-            // FIXED: Remove Gaussian blur entirely - it was causing image softening
-            // Only apply minimal denoising if absolutely necessary on older devices
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
-                // Use very minimal blur only on older devices
-                Imgproc.GaussianBlur(result, result, OpenCVSize(3.0, 3.0), 0.3)
+            val correctedBox = when (rotation) {
+                0 -> {
+                    // No rotation needed
+                    detection.box
+                }
+                90 -> {
+                    // For 90-degree rotation:
+                    // Map (x,y,w,h) => (y, width-x-w, h, w)
+                    YOLO11Detector.BoundingBox(
+                        x = detection.box.y,
+                        y = width - detection.box.x - detection.box.width,
+                        width = detection.box.height,
+                        height = detection.box.width
+                    )
+                }
+                180 -> {
+                    // For 180-degree rotation:
+                    // Map (x,y,w,h) => (width-x-w, height-y-h, w, h)
+                    YOLO11Detector.BoundingBox(
+                        x = width - detection.box.x - detection.box.width,
+                        y = height - detection.box.y - detection.box.height,
+                        width = detection.box.width,
+                        height = detection.box.height
+                    )
+                }
+                270 -> {
+                    // For 270-degree rotation:
+                    // Map (x,y,w,h) => (height-y-h, x, h, w)
+                    YOLO11Detector.BoundingBox(
+                        x = height - detection.box.y - detection.box.height,
+                        y = detection.box.x,
+                        width = detection.box.height,
+                        height = detection.box.width
+                    )
+                }
+                else -> {
+                    // Unexpected rotation value, log and use original
+                    Log.e(TAG, "Unexpected rotation value: $rotation, using original coordinates")
+                    detection.box
+                }
             }
             
-            // Clean up resources
-            yuv.release()
-            for (mat in yuvChannels) {
-                mat.release()
+            // Apply front camera mirroring if needed
+            val finalBox = if (isFrontCamera && (rotation == 90 || rotation == 270)) {
+                // For front camera in portrait orientation, need to mirror horizontally
+                YOLO11Detector.BoundingBox(
+                    x = width - correctedBox.x - correctedBox.width,
+                    y = correctedBox.y,
+                    width = correctedBox.width,
+                    height = correctedBox.height
+                )
+            } else {
+                correctedBox
             }
             
-            return result
-        } catch (e: Exception) {
-            Log.e(TAG, "Image enhancement failed: ${e.message}")
-            // Return original if enhancement fails
-            inputMat.copyTo(result)
-            return result
+            // Log transformed coordinates
+            Log.d(TAG, "Transformed detection: x=${finalBox.x}, y=${finalBox.y}, " +
+                     "w=${finalBox.width}, h=${finalBox.height}")
+            
+            // Create a new detection with the transformed coordinates
+            YOLO11Detector.Detection(
+                classId = detection.classId,
+                conf = detection.conf,
+                box = finalBox
+            )
         }
     }
-    
+
     /**
-     * Rotate bitmap if needed based on camera orientation
-     * Optimized to avoid quality loss during rotation
+     * Improved bitmap rotation with proper orientation handling
      */
     private fun rotateBitmapIfNeeded(bitmap: Bitmap, rotation: Int): Bitmap {
         // Skip if no rotation needed
         if (rotation == 0) return bitmap
         
         try {
+            // Log the rotation being applied
+            Log.d(TAG, "Rotating bitmap by $rotation degrees")
+            
             // Create transformation matrix
             val matrix = Matrix()
+            
+            // Apply rotation
             matrix.postRotate(rotation.toFloat())
             
-            // Optimize memory allocation by reusing bitmaps when possible
+            // Handle front camera mirroring if needed
+            if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
+                // Front camera needs horizontal flipping in portrait orientation
+                if (rotation == 90 || rotation == 270) {
+                    matrix.postScale(-1f, 1f)
+                    Log.d(TAG, "Applied horizontal flip for front camera")
+                }
+            }
+            
+            // Create rotated bitmap
             val rotatedBitmap = Bitmap.createBitmap(
                 bitmap, 
                 0, 0, 
@@ -531,7 +593,7 @@ class CameraManager(
             return bitmap
         }
     }
-    
+
     /**
      * Switch between front and back camera
      */
@@ -581,38 +643,38 @@ class CameraManager(
     }
     
     /**
-     * Handle device orientation changes
-     * @param orientation The new orientation from Configuration.orientation
+     * Enhanced orientation change handler
      */
     fun handleOrientationChange(orientation: Int) {
         try {
             // Log the orientation change
-            Log.d(TAG, "Orientation changed: $orientation")
+            Log.d(TAG, "Orientation changed to: $orientation")
             
-            // Get the current display rotation
-            val rotation = when {
-                context is android.app.Activity -> context.windowManager.defaultDisplay.rotation
-                android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R -> 
-                    context.display?.rotation ?: android.view.Surface.ROTATION_0
-                else -> android.view.Surface.ROTATION_0
+            // Get the display rotation
+            val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                context.display
+            } else {
+                @Suppress("DEPRECATION")
+                (context as? android.app.Activity)?.windowManager?.defaultDisplay
             }
             
-            // If needed, update the camera preview rotation
-            camera?.let { cam ->
-                // We don't need to rebind use cases for orientation changes since CameraX handles this,
-                // but we do need to keep track for our detection transformations
-                currentRotation = when (rotation) {
-                    android.view.Surface.ROTATION_0 -> 0
-                    android.view.Surface.ROTATION_90 -> 90
-                    android.view.Surface.ROTATION_180 -> 180
-                    android.view.Surface.ROTATION_270 -> 270
-                    else -> 0
-                }
-                
-                Log.d(TAG, "Updated current rotation: $currentRotation")
+            val rotation = when (display?.rotation) {
+                android.view.Surface.ROTATION_0 -> 0
+                android.view.Surface.ROTATION_90 -> 90
+                android.view.Surface.ROTATION_180 -> 180
+                android.view.Surface.ROTATION_270 -> 270
+                else -> 0
             }
+            
+            // Log the detected display rotation
+            Log.d(TAG, "Display rotation: $rotation")
+            
+            // Store current rotation for later use in transformations
+            currentRotation = rotation
+            
+            // No need to rebind camera use cases - CameraX handles display rotation automatically
         } catch (e: Exception) {
-            Log.e(TAG, "Error handling orientation change: ${e.message}")
+            Log.e(TAG, "Error handling orientation change: ${e.message}", e)
         }
     }
     

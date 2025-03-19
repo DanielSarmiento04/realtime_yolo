@@ -249,64 +249,154 @@ class CameraManager(
      * Extension function to convert ImageProxy to Bitmap
      */
     private suspend fun ImageProxy.toBitmap(): Bitmap = withContext(Dispatchers.IO) {
-        val buffer = planes[0].buffer
-        val pixelStride = planes[0].pixelStride
-        val rowStride = planes[0].rowStride
-        val rowPadding = rowStride - pixelStride * width
+        try {
+            // For YUV_420_888 format (most common in CameraX), use the more reliable method
+            if (format == ImageFormat.YUV_420_888) {
+                return@withContext convertYuv420ToBitmap()
+            }
+            
+            // For JPEG format, use a different approach
+            if (format == ImageFormat.JPEG) {
+                val buffer = planes[0].buffer
+                val bytes = ByteArray(buffer.capacity())
+                buffer.rewind()
+                buffer.get(bytes)
+                return@withContext BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            }
+
+            // For other formats, try a safer approach that doesn't rely on copyPixelsFromBuffer
+            val yuvImage = when (format) {
+                ImageFormat.YUV_420_888 -> convertYuv420ToBitmap()
+                else -> {
+                    // Create a new bitmap and draw directly from source
+                    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                    val canvas = android.graphics.Canvas(bitmap)
+                    val paint = android.graphics.Paint()
+                    paint.color = android.graphics.Color.BLACK
+                    canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
+                    
+                    // Try to draw something useful if possible
+                    try {
+                        val mat = Mat(height, width, CvType.CV_8UC4)
+                        val rgba = Mat()
+                        Imgproc.cvtColor(mat, rgba, Imgproc.COLOR_BGR2RGBA)
+                        Utils.matToBitmap(rgba, bitmap)
+                        mat.release()
+                        rgba.release()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to convert to bitmap: ${e.message}")
+                    }
+                    
+                    bitmap
+                }
+            }
+            
+            return@withContext yuvImage
+            
+        } catch (e: Exception) {
+            // Final fallback: create an emergency bitmap
+            Log.e(TAG, "All bitmap conversion methods failed: ${e.message}")
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(bitmap)
+            val paint = android.graphics.Paint()
+            paint.color = android.graphics.Color.RED
+            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
+            return@withContext bitmap
+        }
+    }
+
+    /**
+     * Convert YUV_420_888 format ImageProxy to Bitmap
+     * Comprehensive implementation that handles different pixel strides and formats
+     */
+    private suspend fun ImageProxy.convertYuv420ToBitmap(): Bitmap = withContext(Dispatchers.IO) {
+        // Get image planes
+        val yPlane = planes[0]
+        val uPlane = planes[1]
+        val vPlane = planes[2]
         
-        // Create bitmap with correct dimensions
-        val bitmap = Bitmap.createBitmap(
-            width + rowPadding / pixelStride,
-            height,
-            Bitmap.Config.ARGB_8888
-        )
+        // Get plane buffers
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
         
-        // Copy the data to the bitmap
-        buffer.rewind()
-        bitmap.copyPixelsFromBuffer(buffer)
+        // Get buffer sizes
+        val ySize = yBuffer.remaining()
         
-        // If the format is not ARGB_8888, we need to convert using OpenCV
-        // Note: Changed from RGBA_8888 to checking if format is YUV_420_888 or other
-        if (format == ImageFormat.YUV_420_888 || format == ImageFormat.JPEG) {
-            try {
-                val imageMat = Mat()
-                Utils.bitmapToMat(bitmap, imageMat)
+        // Create properly sized byte array for NV21 format
+        val nv21Size = width * height * 3 / 2  // This is the standard size for YUV420/NV21 format
+        val nv21 = ByteArray(nv21Size)
+        
+        // Get strides for proper conversion
+        val yRowStride = yPlane.rowStride
+        val yPixelStride = yPlane.pixelStride
+        
+        // Copy Y plane with handling for different strides
+        var position = 0
+        
+        // Reset buffer position
+        yBuffer.rewind()
+        
+        if (yRowStride == width && yPixelStride == 1) {
+            // Fast path - can copy in one go
+            yBuffer.get(nv21, 0, width * height)
+            position = width * height
+        } else {
+            // Slower path - copy row by row
+            for (row in 0 until height) {
+                // Position buffer at start of row
+                yBuffer.position(row * yRowStride)
                 
-                // Convert based on the format
-                val rgbaMat = Mat()
-                when (format) {
-                    ImageFormat.YUV_420_888 -> {
-                        // For YUV format, use the more comprehensive method
-                        val yuvMat = imageToYuvMat(this@toBitmap)
-                        Imgproc.cvtColor(yuvMat, rgbaMat, Imgproc.COLOR_YUV2RGBA_NV21)
-                        yuvMat.release()
-                    }
-                    ImageFormat.JPEG -> {
-                        Imgproc.cvtColor(imageMat, rgbaMat, Imgproc.COLOR_BGR2RGBA)
-                    }
-                    else -> {
-                        // For other formats, try a simple BGR to RGBA conversion
-                        Imgproc.cvtColor(imageMat, rgbaMat, Imgproc.COLOR_BGR2RGBA)
+                // Copy pixels from this row
+                for (col in 0 until width) {
+                    nv21[position++] = yBuffer.get()
+                    // Skip extra pixels in row if needed
+                    if (col < width - 1 && yPixelStride > 1) {
+                        yBuffer.position(yBuffer.position() + yPixelStride - 1)
                     }
                 }
-                
-                // Convert back to bitmap
-                val resultBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(rgbaMat, resultBitmap)
-                
-                // Clean up
-                imageMat.release()
-                rgbaMat.release()
-                bitmap.recycle()
-                
-                return@withContext resultBitmap
-            } catch (e: Exception) {
-                Log.e(TAG, "Error converting image format: ${e.message}")
-                // Fall through to return original bitmap if conversion fails
             }
         }
         
-        return@withContext bitmap
+        // Calculate U/V positioning
+        val uvRowStride = uPlane.rowStride
+        val uvPixelStride = uPlane.pixelStride
+        val uvWidth = width / 2
+        val uvHeight = height / 2
+        
+        // Copy U/V data
+        for (row in 0 until uvHeight) {
+            for (col in 0 until uvWidth) {
+                // Calculate buffer positions
+                val uvRow = row
+                val uvCol = col
+                val uvIndex = uvRow * uvRowStride + uvCol * uvPixelStride
+                
+                // Add V value then U value for NV21 format
+                if (uvIndex < vBuffer.capacity())
+                    nv21[position++] = vBuffer.get(uvIndex)
+                else
+                    nv21[position++] = 0  // Default value if out of bounds
+                    
+                if (uvIndex < uBuffer.capacity())    
+                    nv21[position++] = uBuffer.get(uvIndex)
+                else
+                    nv21[position++] = 0  // Default value if out of bounds
+            }
+        }
+        
+        // Convert to Bitmap via YuvImage -> JPEG -> Bitmap
+        val yuvImage = android.graphics.YuvImage(
+            nv21, 
+            android.graphics.ImageFormat.NV21,
+            width, height, null
+        )
+        
+        val out = java.io.ByteArrayOutputStream()
+        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
+        val imageBytes = out.toByteArray()
+        
+        return@withContext BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
     }
 
     /**
@@ -403,59 +493,6 @@ class CameraManager(
         // Reshape to proper dimensions for OpenCV processing
         val yuv420sp = yuvMat.reshape(1, height + height/2)
         return yuv420sp
-    }
-
-    /**
-     * Alternative image conversion implementation for different image formats
-     * This handles YUV_420_888 format which is common in CameraX
-     */
-    private suspend fun ImageProxy.toArgb8888Bitmap(): Bitmap = withContext(Dispatchers.IO) {
-        val image = this@toArgb8888Bitmap
-        val planes = image.planes
-        
-        val yBuffer = planes[0].buffer
-        val uBuffer = planes[1].buffer
-        val vBuffer = planes[2].buffer
-        
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
-        
-        val nv21 = ByteArray(ySize + uSize + vSize)
-        
-        // Copy Y plane
-        yBuffer.get(nv21, 0, ySize)
-        
-        // Interleave U and V planes
-        // This handles the fact that U and V planes in YUV_420_888 can have different strides
-        val uvStride = planes[1].rowStride
-        val uvWidth = width / 2
-        val uvHeight = height / 2
-        
-        var uvPos = 0
-        val uvBufferPos = uvStride * uvHeight - uvWidth // Position the buffer at the last row
-        
-        for (row in uvHeight - 1 downTo 0) {
-            for (col in 0 until uvWidth) {
-                val bufferIndex = uvBufferPos + (row * uvStride) + col
-                nv21[ySize + uvPos + 0] = vBuffer.get(bufferIndex)      // V
-                nv21[ySize + uvPos + 1] = uBuffer.get(bufferIndex)      // U
-                uvPos += 2
-            }
-        }
-        
-        // Convert NV21 to Bitmap
-        val yuvImage = android.graphics.YuvImage(
-            nv21, 
-            android.graphics.ImageFormat.NV21,
-            width, height, null
-        )
-        
-        val out = java.io.ByteArrayOutputStream()
-        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 100, out)
-        val imageBytes = out.toByteArray()
-        
-        return@withContext BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
     }
 
     /**

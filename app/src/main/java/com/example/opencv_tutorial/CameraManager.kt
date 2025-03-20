@@ -9,6 +9,8 @@ import android.media.Image
 import android.os.Build
 import android.util.Log
 import android.util.Size
+import android.view.Surface
+import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
@@ -137,7 +139,7 @@ class CameraManager(
     private fun configureCamera() {
         camera?.let { camera ->
             // Enable auto-exposure, auto-focus
-            camera.cameraControl.enableTorch(false)
+            camera.cameraControl.enableTorch(true)
             
             try {
                 // Set optimal camera mode for video/preview
@@ -179,44 +181,55 @@ class CameraManager(
         // Get the image rotation from camera
         val imageRotation = image.imageInfo.rotationDegrees
         
+        // Get device orientation
+        val deviceOrientation = getDeviceOrientation()
+        
         // Store rotation for coordinate transformation and logging
         currentRotation = imageRotation
         
         // Log rotation values for debugging
-        Log.d(TAG, "Processing image with rotation: $imageRotation, image dimensions: ${image.width}x${image.height}")
+        Log.d(TAG, "Processing image: rotation=$imageRotation, device orientation=$deviceOrientation, " +
+              "dimensions=${image.width}x${image.height}, facing=${if (lensFacing == CameraSelector.LENS_FACING_FRONT) "FRONT" else "BACK"}")
 
         // Convert image to bitmap in IO dispatcher
         processingScope.launch {
             try {
-                // Get bitmap from image proxy (efficient conversion)
+                // Convert image to bitmap (efficient conversion)
                 val bitmap = image.toBitmap()
                 
-                // Reorient bitmap if needed based on device orientation and camera facing
-                val rotatedBitmap = rotateBitmapIfNeeded(bitmap, imageRotation)
+                // PRE-PROCESSING: Prepare the bitmap for inference by ensuring correct orientation for the model
+                val preparedBitmap = prepareForInference(bitmap, imageRotation, deviceOrientation)
                 
-                // Log the size of rotated bitmap
-                Log.d(TAG, "Rotated bitmap dimensions: ${rotatedBitmap.width}x${rotatedBitmap.height}")
+                // Log prepared bitmap dimensions
+                Log.d(TAG, "Prepared bitmap for inference: ${preparedBitmap.width}x${preparedBitmap.height}")
+                
+                // Declare display bitmap at outer scope with a default value
+                var displayBitmap = bitmap
                 
                 // Get detector instance from the parent activity
                 val detector = YOLODetectorProvider.getDetector(context)
                 
                 if (detector != null) {
-                    // Run detection with high-quality preprocessed image
-                    val detections = detector.detect(rotatedBitmap)
+                    // Run detection on the properly oriented bitmap
+                    val detections = detector.detect(preparedBitmap)
                     
-                    // Apply rotation correction to detection coordinates
-                    val correctedDetections = transformDetectionsBasedOnOrientation(
+                    // POST-PROCESSING: Prepare the bitmap for display and correct detection coordinates
+                    displayBitmap = prepareForDisplay(bitmap, imageRotation, deviceOrientation)
+                    
+                    // Transform detection coordinates to match the display bitmap
+                    val correctedDetections = transformDetectionsForDisplay(
                         detections, 
-                        rotatedBitmap.width, 
-                        rotatedBitmap.height, 
-                        imageRotation
+                        preparedBitmap.width, preparedBitmap.height,
+                        displayBitmap.width, displayBitmap.height,
+                        imageRotation,
+                        deviceOrientation
                     )
                     
                     // Track performance
                     val processingTime = System.currentTimeMillis() - startTime
                     performanceTracker.addMeasurement(processingTime)
                     
-                    // Log performance every 30 frames
+                    // Log performance periodically
                     if (performanceTracker.totalFrames % 30 == 0) {
                         val avgFps = 1000.0 / performanceTracker.getAverageProcessingTime()
                         Log.d(TAG, "Avg processing time: ${performanceTracker.getAverageProcessingTime()}ms, " +
@@ -224,14 +237,19 @@ class CameraManager(
                                 "Detections: ${correctedDetections.size}")
                     }
                     
-                    // Notify UI on main thread with corrected detections
+                    // Notify UI on main thread with display bitmap and corrected detections
                     withContext(Dispatchers.Main) {
-                        onFrameProcessed?.invoke(rotatedBitmap, correctedDetections, processingTime)
+                        onFrameProcessed?.invoke(displayBitmap, correctedDetections, processingTime)
+                    }
+                    
+                    // Clean up if needed
+                    if (preparedBitmap != bitmap && preparedBitmap != displayBitmap) {
+                        preparedBitmap.recycle()
                     }
                 }
                 
-                // Clean up temporary bitmaps to avoid memory leaks
-                if (bitmap != rotatedBitmap && rotatedBitmap !== viewFinder.bitmap) {
+                // Clean up bitmap if needed and not reused
+                if (bitmap != preparedBitmap && bitmap != displayBitmap && bitmap != viewFinder.bitmap) {
                     bitmap.recycle()
                 }
                 
@@ -242,6 +260,250 @@ class CameraManager(
                 image.close()
                 isProcessing = false
             }
+        }
+    }
+
+    /**
+     * Get the current device orientation
+     */
+    private fun getDeviceOrientation(): Int {
+        val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            context.display
+        } else {
+            @Suppress("DEPRECATION")
+            (context as? AppCompatActivity)?.windowManager?.defaultDisplay
+        }
+        
+        return when (display?.rotation) {
+            Surface.ROTATION_0 -> 0      // Portrait
+            Surface.ROTATION_90 -> 90    // Landscape right
+            Surface.ROTATION_180 -> 180  // Portrait upside down
+            Surface.ROTATION_270 -> 270  // Landscape left
+            else -> 0  // Default to portrait if unknown
+        }
+    }
+
+    /**
+     * Prepare bitmap for model inference with proper orientation
+     * Ensures the bitmap is in the orientation expected by the model
+     */
+    private fun prepareForInference(bitmap: Bitmap, imageRotation: Int, deviceOrientation: Int): Bitmap {
+        // For YOLO, we typically want the image in its natural orientation (not rotated)
+        // The model expects images in natural orientation, so we need to correct camera rotation
+        
+        // Most YOLO models expect the image in the format they were trained on
+        // which is typically natural orientation (like viewing an image in a photo viewer)
+        
+        try {
+            // Create transformation matrix
+            val matrix = Matrix()
+            
+            // For back camera:
+            // - In portrait mode: rotate 90 degrees (phone is upright, camera sensor is landscape)
+            // - In landscape mode: no rotation (both phone and camera sensor are landscape)
+            
+            // For front camera:
+            // - In portrait mode: rotate 90 degrees and mirror horizontally
+            // - In landscape mode: mirror horizontally (selfie mirroring)
+            
+            val isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
+            val isPortrait = deviceOrientation == 0 || deviceOrientation == 180
+            
+            if (isPortrait) {
+                // Portrait mode - camera sensor is rotated 90 degrees from natural orientation
+                matrix.postRotate(90f)
+                
+                // Mirror for front camera
+                if (isFrontCamera) {
+                    matrix.postScale(-1f, 1f)
+                }
+            } else {
+                // Landscape mode - camera sensor is aligned with natural orientation
+                // but may need mirroring for front camera
+                if (isFrontCamera) {
+                    matrix.postScale(-1f, 1f)
+                }
+            }
+            
+            // Create transformed bitmap
+            val preparedBitmap = Bitmap.createBitmap(
+                bitmap,
+                0, 0,
+                bitmap.width, bitmap.height,
+                matrix,
+                true
+            )
+            
+            Log.d(TAG, "Prepared inference bitmap: orientation=${if (isPortrait) "portrait" else "landscape"}, " +
+                      "front=${isFrontCamera}, rotation=${imageRotation}")
+            
+            return preparedBitmap
+        } catch (e: Exception) {
+            Log.e(TAG, "Error preparing bitmap for inference: ${e.message}")
+            return bitmap
+        }
+    }
+
+    /**
+     * Prepare bitmap for display with proper orientation
+     * Ensures the bitmap is oriented correctly for the screen
+     */
+    private fun prepareForDisplay(bitmap: Bitmap, imageRotation: Int, deviceOrientation: Int): Bitmap {
+        try {
+            // Create transformation matrix
+            val matrix = Matrix()
+            
+            // The display orientation needs to match the device orientation
+            val isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
+            val isPortrait = deviceOrientation == 0 || deviceOrientation == 180
+            
+            if (isPortrait) {
+                // Portrait orientation - rotate camera output to match device orientation
+                // Camera sensor is landscape, device is portrait, so rotate 90 degrees
+                matrix.postRotate(90f)
+                
+                // Additional rotation for different device orientations
+                if (deviceOrientation == 180) {
+                    matrix.postRotate(180f)
+                }
+                
+                // Mirror for front camera
+                if (isFrontCamera) {
+                    matrix.postScale(-1f, 1f) 
+                }
+            } else {
+                // Landscape orientation
+                // Different handling based on landscape left vs right
+                if (deviceOrientation == 270) {
+                    matrix.postRotate(180f)
+                }
+                
+                // Mirror for front camera
+                if (isFrontCamera) {
+                    matrix.postScale(-1f, 1f)
+                }
+            }
+            
+            // Create transformed bitmap
+            val displayBitmap = Bitmap.createBitmap(
+                bitmap,
+                0, 0,
+                bitmap.width, bitmap.height,
+                matrix,
+                true
+            )
+            
+            Log.d(TAG, "Prepared display bitmap: orientation=${if (isPortrait) "portrait" else "landscape"}, " +
+                      "front=${isFrontCamera}, deviceOrientation=${deviceOrientation}")
+            
+            return displayBitmap
+        } catch (e: Exception) {
+            Log.e(TAG, "Error preparing bitmap for display: ${e.message}")
+            return bitmap
+        }
+    }
+
+    /**
+     * Transform detection coordinates to match the display bitmap
+     */
+    private fun transformDetectionsForDisplay(
+        detections: List<YOLO11Detector.Detection>,
+        inferenceWidth: Int, inferenceHeight: Int,
+        displayWidth: Int, displayHeight: Int,
+        imageRotation: Int,
+        deviceOrientation: Int
+    ): List<YOLO11Detector.Detection> {
+        // Log the transformation parameters
+        Log.d(TAG, "Transforming detections: inference=${inferenceWidth}x${inferenceHeight}, " +
+                  "display=${displayWidth}x${displayHeight}, " +
+                  "imageRotation=${imageRotation}, deviceOrientation=${deviceOrientation}")
+        
+        // Calculate scale factors if inference and display bitmaps have different dimensions
+        val scaleX = displayWidth.toFloat() / inferenceWidth
+        val scaleY = displayHeight.toFloat() / inferenceHeight
+        
+        val isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
+        val isPortrait = deviceOrientation == 0 || deviceOrientation == 180
+        
+        return detections.map { detection ->
+            // Start with the original coordinates (normalized to the inference bitmap)
+            val originalX = detection.box.x
+            val originalY = detection.box.y
+            val originalWidth = detection.box.width
+            val originalHeight = detection.box.height
+            
+            // Variables to hold the transformed coordinates
+            var newX: Float
+            var newY: Float
+            var newWidth: Float
+            var newHeight: Float
+            
+            if (isPortrait) {
+                // In portrait mode, width and height are swapped due to 90-degree rotation
+                // X becomes Y, Y becomes (width - X - W)
+                if (isFrontCamera && (deviceOrientation == 0 || deviceOrientation == 180)) {
+                    // Front camera in portrait mode (mirrored)
+                    newX = originalY * scaleX
+                    newY = (inferenceWidth - originalX - originalWidth) * scaleY
+                    newWidth = originalHeight * scaleX
+                    newHeight = originalWidth * scaleY
+                    
+                    // Additional flip for upside-down portrait
+                    if (deviceOrientation == 180) {
+                        newY = displayHeight - newY - newHeight
+                    }
+                } else {
+                    // Back camera in portrait mode
+                    newX = originalY * scaleX
+                    newY = (inferenceWidth - originalX - originalWidth) * scaleY
+                    newWidth = originalHeight * scaleX
+                    newHeight = originalWidth * scaleY
+                    
+                    // Additional handling for upside-down portrait
+                    if (deviceOrientation == 180) {
+                        newY = displayHeight - newY - newHeight
+                    }
+                }
+            } else {
+                // In landscape mode
+                if (isFrontCamera) {
+                    // Front camera in landscape mode (mirrored horizontally)
+                    newX = (inferenceWidth - originalX - originalWidth) * scaleX
+                    newY = originalY * scaleY
+                    newWidth = originalWidth * scaleX
+                    newHeight = originalHeight * scaleY
+                    
+                    // Additional flip for landscape left
+                    if (deviceOrientation == 270) {
+                        newY = displayHeight - newY - newHeight
+                        newX = displayWidth - newX - newWidth
+                    }
+                } else {
+                    // Back camera in landscape mode
+                    newX = originalX * scaleX
+                    newY = originalY * scaleY
+                    newWidth = originalWidth * scaleX
+                    newHeight = originalHeight * scaleY
+                    
+                    // Additional flip for landscape left
+                    if (deviceOrientation == 270) {
+                        newY = displayHeight - newY - newHeight
+                        newX = displayWidth - newX - newWidth
+                    }
+                }
+            }
+            
+            // Create a new detection with the transformed coordinates
+            YOLO11Detector.Detection(
+                classId = detection.classId,
+                conf = detection.conf,
+                box = YOLO11Detector.BoundingBox(
+                    x = newX.toInt(),
+                    y = newY.toInt(),
+                    width = newWidth.toInt(),
+                    height = newHeight.toInt()
+                )
+            )
         }
     }
 
@@ -592,23 +854,61 @@ class CameraManager(
         if (rotation == 0) return bitmap
         
         try {
-            // Log the rotation being applied
-            Log.d(TAG, "Rotating bitmap by $rotation degrees")
+            // Get device rotation from activity context
+            val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                context.display
+            } else {
+                @Suppress("DEPRECATION")
+                (context as? AppCompatActivity)?.windowManager?.defaultDisplay
+            }
+            
+            // Default to 0 (portrait) if display info can't be determined
+            val deviceOrientation = when (display?.rotation) {
+                Surface.ROTATION_0 -> 0    // Portrait
+                Surface.ROTATION_90 -> 90  // Landscape right
+                Surface.ROTATION_180 -> 180 // Portrait upside down
+                Surface.ROTATION_270 -> 270 // Landscape left
+                else -> 0
+            }
+            
+            // Log debug information
+            Log.d(TAG, "Device orientation: $deviceOrientation, Camera rotation: $rotation, " +
+                     "Camera facing: ${if (lensFacing == CameraSelector.LENS_FACING_FRONT) "FRONT" else "BACK"}")
             
             // Create transformation matrix
             val matrix = Matrix()
             
-            // Apply rotation
-            matrix.postRotate(rotation.toFloat())
+            // Determine if we're in portrait or landscape mode
+            val isPortrait = deviceOrientation == 0 || deviceOrientation == 180
+            val isLandscape = deviceOrientation == 90 || deviceOrientation == 270
             
-            // Handle front camera mirroring if needed
-            if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
-                // Front camera needs horizontal flipping in portrait orientation
-                if (rotation == 90 || rotation == 270) {
-                    matrix.postScale(-1f, 1f)
-                    Log.d(TAG, "Applied horizontal flip for front camera")
+            // Handle different rotation scenarios based on device orientation and camera facing
+            if (lensFacing == CameraSelector.LENS_FACING_BACK) {
+                // Back camera rotation handling
+                if (isPortrait) {
+                    // Portrait mode - rotate 90 degrees counterclockwise
+                    matrix.postRotate(rotation.toFloat())
+                } else {
+                    // Landscape mode - align camera output with display orientation
+                    val correctedRotation = (rotation + deviceOrientation) % 360
+                    matrix.postRotate(correctedRotation.toFloat())
+                }
+            } else {
+                // Front camera rotation handling - needs mirroring
+                if (isPortrait) {
+                    // Front camera in portrait mode - rotate and mirror
+                    matrix.postScale(-1f, 1f) // Mirror horizontally
+                    matrix.postRotate(rotation.toFloat())
+                } else {
+                    // Front camera in landscape mode
+                    val correctedRotation = (rotation + deviceOrientation) % 360
+                    matrix.postScale(-1f, 1f) // Mirror horizontally
+                    matrix.postRotate(correctedRotation.toFloat())
                 }
             }
+            
+            // Log transformation details
+            Log.d(TAG, "Applied transformation: rotation=$rotation, mirrored=${lensFacing == CameraSelector.LENS_FACING_FRONT}")
             
             // Create rotated bitmap
             val rotatedBitmap = Bitmap.createBitmap(
@@ -619,10 +919,13 @@ class CameraManager(
                 true
             )
             
-            // Only recycle original if it's different from what we started with
+            // Performance optimization: only recycle original if it's different from what we started with
             if (bitmap != rotatedBitmap && bitmap != viewFinder.bitmap) {
                 bitmap.recycle()
             }
+            
+            // Log output dimensions for verification
+            Log.d(TAG, "Rotated bitmap dimensions: ${rotatedBitmap.width}x${rotatedBitmap.height}")
             
             return rotatedBitmap
         } catch (e: Exception) {

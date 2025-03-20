@@ -1,10 +1,15 @@
 package com.example.opencv_tutorial
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.graphics.RectF
+import android.graphics.SurfaceTexture
 import android.media.Image
 import android.os.Build
 import android.util.Log
@@ -60,6 +65,9 @@ class CameraManager(
     
     // Frame processing callback
     var onFrameProcessed: ((Bitmap, List<YOLO11Detector.Detection>, Long) -> Unit)? = null
+    
+    // Flag to track if we're using the front camera
+    private var isFrontCamera = false
     
     companion object {
         private const val TAG = "CameraManager"
@@ -284,63 +292,86 @@ class CameraManager(
     }
 
     /**
-     * Prepare bitmap for model inference with proper orientation
-     * Ensures the bitmap is in the orientation expected by the model
+     * Prepares the bitmap for inference by ensuring it's in the correct orientation for the model.
+     * This method will handle rotation and mirroring as needed for both front and back cameras.
      */
     private fun prepareForInference(bitmap: Bitmap, imageRotation: Int, deviceOrientation: Int): Bitmap {
-        // For YOLO, we typically want the image in its natural orientation (not rotated)
-        // The model expects images in natural orientation, so we need to correct camera rotation
-        
-        // Most YOLO models expect the image in the format they were trained on
-        // which is typically natural orientation (like viewing an image in a photo viewer)
+        Log.d(TAG, "Preparing bitmap for inference: rotation=$imageRotation, device=$deviceOrientation, " +
+                "size=${bitmap.width}x${bitmap.height}, front=${isFrontCamera}")
         
         try {
-            // Create transformation matrix
+            // Step 1: Apply necessary rotation based on image rotation
+            val rotationNeeded = if (imageRotation == 0) 0 else imageRotation
             val matrix = Matrix()
             
-            // For back camera:
-            // - In portrait mode: rotate 90 degrees (phone is upright, camera sensor is landscape)
-            // - In landscape mode: no rotation (both phone and camera sensor are landscape)
-            
-            // For front camera:
-            // - In portrait mode: rotate 90 degrees and mirror horizontally
-            // - In landscape mode: mirror horizontally (selfie mirroring)
-            
-            val isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
-            val isPortrait = deviceOrientation == 0 || deviceOrientation == 180
-            
-            if (isPortrait) {
-                // Portrait mode - camera sensor is rotated 90 degrees from natural orientation
-                matrix.postRotate(90f)
-                
-                // Mirror for front camera
-                if (isFrontCamera) {
-                    matrix.postScale(-1f, 1f)
-                }
-            } else {
-                // Landscape mode - camera sensor is aligned with natural orientation
-                // but may need mirroring for front camera
-                if (isFrontCamera) {
-                    matrix.postScale(-1f, 1f)
-                }
+            // Apply base rotation from image
+            if (rotationNeeded != 0) {
+                matrix.postRotate(rotationNeeded.toFloat())
             }
             
-            // Create transformed bitmap
-            val preparedBitmap = Bitmap.createBitmap(
-                bitmap,
-                0, 0,
-                bitmap.width, bitmap.height,
-                matrix,
-                true
-            )
+            // Step 2: Mirror image if using front camera (selfie mode)
+            if (isFrontCamera) {
+                // For front camera, we need to mirror horizontally after rotation
+                matrix.postScale(-1f, 1f)
+            }
             
-            Log.d(TAG, "Prepared inference bitmap: orientation=${if (isPortrait) "portrait" else "landscape"}, " +
-                      "front=${isFrontCamera}, rotation=${imageRotation}")
+            // Step 3: Create rotated bitmap
+            val rotatedBitmap = if (rotationNeeded != 0 || isFrontCamera) {
+                Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+            } else {
+                bitmap // No transformation needed
+            }
             
-            return preparedBitmap
+            // Step 4: Apply letterboxing to maintain aspect ratio while resizing to model input size
+            // YOLO models typically expect square inputs (e.g., 640x640)
+            val modelInputSize = 640 // Standard YOLO input size
+            
+            // Calculate scaling to maintain aspect ratio
+            val bitmapAspectRatio = rotatedBitmap.width.toFloat() / rotatedBitmap.height.toFloat()
+            val targetScale: Float
+            val scaledWidth: Int
+            val scaledHeight: Int
+            
+            if (bitmapAspectRatio > 1) {
+                // Width is larger than height
+                scaledWidth = modelInputSize
+                scaledHeight = (modelInputSize / bitmapAspectRatio).toInt()
+                targetScale = modelInputSize.toFloat() / rotatedBitmap.width
+            } else {
+                // Height is larger than width
+                scaledHeight = modelInputSize
+                scaledWidth = (modelInputSize * bitmapAspectRatio).toInt()
+                targetScale = modelInputSize.toFloat() / rotatedBitmap.height
+            }
+            
+            // Create a bitmap with the target size and a gray background (114 is YOLO standard padding color)
+            val paddedBitmap = Bitmap.createBitmap(modelInputSize, modelInputSize, Bitmap.Config.ARGB_8888)
+            paddedBitmap.eraseColor(Color.rgb(114, 114, 114)) // Standard YOLO padding color
+            
+            // Draw the scaled image on the padded bitmap
+            val canvas = Canvas(paddedBitmap)
+            val scaledBitmap = Bitmap.createScaledBitmap(rotatedBitmap, scaledWidth, scaledHeight, true)
+            
+            // Center the scaled bitmap on the padded bitmap
+            val left = (modelInputSize - scaledWidth) / 2f
+            val top = (modelInputSize - scaledHeight) / 2f
+            canvas.drawBitmap(scaledBitmap, left, top, null)
+            
+            // Clean up if we created a new bitmap
+            if (rotatedBitmap != bitmap) {
+                rotatedBitmap.recycle()
+            }
+            if (scaledBitmap != rotatedBitmap) {
+                scaledBitmap.recycle()
+            }
+            
+            Log.d(TAG, "Prepared inference bitmap: ${paddedBitmap.width}x${paddedBitmap.height} " +
+                    "(scaled from ${scaledWidth}x${scaledHeight}, original ${bitmap.width}x${bitmap.height})")
+            
+            return paddedBitmap
         } catch (e: Exception) {
-            Log.e(TAG, "Error preparing bitmap for inference: ${e.message}")
-            return bitmap
+            Log.e(TAG, "Error preparing bitmap for inference", e)
+            return bitmap // Return original on error
         }
     }
 
@@ -354,7 +385,6 @@ class CameraManager(
             val matrix = Matrix()
             
             // The display orientation needs to match the device orientation
-            val isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
             val isPortrait = deviceOrientation == 0 || deviceOrientation == 180
             
             if (isPortrait) {
@@ -404,7 +434,8 @@ class CameraManager(
     }
 
     /**
-     * Transform detection coordinates to match the display bitmap
+     * Transforms detection coordinates from inference space to display space
+     * Now accounts for letterboxing in addition to rotation and scaling
      */
     private fun transformDetectionsForDisplay(
         detections: List<YOLO11Detector.Detection>,
@@ -413,26 +444,71 @@ class CameraManager(
         imageRotation: Int,
         deviceOrientation: Int
     ): List<YOLO11Detector.Detection> {
-        // Log the transformation parameters
+        if (detections.isEmpty()) return emptyList()
+        
         Log.d(TAG, "Transforming detections: inference=${inferenceWidth}x${inferenceHeight}, " +
-                  "display=${displayWidth}x${displayHeight}, " +
-                  "imageRotation=${imageRotation}, deviceOrientation=${deviceOrientation}")
+              "display=${displayWidth}x${displayHeight}, rotation=$imageRotation, orientation=$deviceOrientation")
         
-        // Calculate scale factors if inference and display bitmaps have different dimensions
-        val scaleX = displayWidth.toFloat() / inferenceWidth
-        val scaleY = displayHeight.toFloat() / inferenceHeight
-        
+        val transformed = mutableListOf<YOLO11Detector.Detection>()
         val isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
         val isPortrait = deviceOrientation == 0 || deviceOrientation == 180
         
-        return detections.map { detection ->
-            // Start with the original coordinates (normalized to the inference bitmap)
-            val originalX = detection.box.x
-            val originalY = detection.box.y
-            val originalWidth = detection.box.width
-            val originalHeight = detection.box.height
+        // Calculate letterboxing parameters (this matches what we did in prepareForInference)
+        val modelInputSize = 640 // Standard YOLO input size
+        
+        // These are the actual dimensions of the image within the letterboxed square
+        val originalBitmapAspectRatio: Float 
+        val actualInferenceWidth: Int
+        val actualInferenceHeight: Int
+        val offsetX: Float
+        val offsetY: Float
+        
+        if (isPortrait) {
+            // In portrait mode, width and height are swapped in the original image
+            originalBitmapAspectRatio = displayHeight.toFloat() / displayWidth.toFloat()
+        } else {
+            originalBitmapAspectRatio = displayWidth.toFloat() / displayHeight.toFloat()
+        }
+        
+        if (originalBitmapAspectRatio > 1) {
+            // Width is larger than height (in inference space)
+            actualInferenceWidth = modelInputSize
+            actualInferenceHeight = (modelInputSize / originalBitmapAspectRatio).toInt()
+            offsetX = 0f
+            offsetY = (modelInputSize - actualInferenceHeight) / 2f
+        } else {
+            // Height is larger than width (in inference space)
+            actualInferenceHeight = modelInputSize
+            actualInferenceWidth = (modelInputSize * originalBitmapAspectRatio).toInt()
+            offsetX = (modelInputSize - actualInferenceWidth) / 2f
+            offsetY = 0f
+        }
+        
+        // Log letterbox parameters
+        Log.d(TAG, "Letterbox parameters: aspect=$originalBitmapAspectRatio, " +
+              "actual inference size=${actualInferenceWidth}x${actualInferenceHeight}, " +
+              "offset=($offsetX, $offsetY)")
+        
+        // Calculate scaling factors from actual inference dimensions to display dimensions
+        val scaleX = displayWidth.toFloat() / actualInferenceWidth
+        val scaleY = displayHeight.toFloat() / actualInferenceHeight
+        
+        for (detection in detections) {
+            val box = detection.box
             
-            // Variables to hold the transformed coordinates
+            // First, adjust coordinates to account for letterboxing
+            var originalX = (box.x - offsetX)
+            var originalY = (box.y - offsetY)
+            var originalWidth = box.width
+            var originalHeight = box.height
+            
+            // Check if dimensions are valid
+            if (originalWidth <= 0 || originalHeight <= 0) {
+                Log.w(TAG, "Invalid detection dimensions: $originalWidth x $originalHeight")
+                continue
+            }
+            
+            // Apply the appropriate coordinate transformation based on device orientation
             var newX: Float
             var newY: Float
             var newWidth: Float
@@ -440,11 +516,10 @@ class CameraManager(
             
             if (isPortrait) {
                 // In portrait mode, width and height are swapped due to 90-degree rotation
-                // X becomes Y, Y becomes (width - X - W)
                 if (isFrontCamera && (deviceOrientation == 0 || deviceOrientation == 180)) {
                     // Front camera in portrait mode (mirrored)
                     newX = originalY * scaleX
-                    newY = (inferenceWidth - originalX - originalWidth) * scaleY
+                    newY = (actualInferenceWidth - originalX - originalWidth) * scaleY
                     newWidth = originalHeight * scaleX
                     newHeight = originalWidth * scaleY
                     
@@ -455,7 +530,7 @@ class CameraManager(
                 } else {
                     // Back camera in portrait mode
                     newX = originalY * scaleX
-                    newY = (inferenceWidth - originalX - originalWidth) * scaleY
+                    newY = originalX * scaleY
                     newWidth = originalHeight * scaleX
                     newHeight = originalWidth * scaleY
                     
@@ -468,7 +543,7 @@ class CameraManager(
                 // In landscape mode
                 if (isFrontCamera) {
                     // Front camera in landscape mode (mirrored horizontally)
-                    newX = (inferenceWidth - originalX - originalWidth) * scaleX
+                    newX = (actualInferenceWidth - originalX - originalWidth) * scaleX
                     newY = originalY * scaleY
                     newWidth = originalWidth * scaleX
                     newHeight = originalHeight * scaleY
@@ -476,7 +551,6 @@ class CameraManager(
                     // Additional flip for landscape left
                     if (deviceOrientation == 270) {
                         newY = displayHeight - newY - newHeight
-                        newX = displayWidth - newX - newWidth
                     }
                 } else {
                     // Back camera in landscape mode
@@ -488,23 +562,32 @@ class CameraManager(
                     // Additional flip for landscape left
                     if (deviceOrientation == 270) {
                         newY = displayHeight - newY - newHeight
-                        newX = displayWidth - newX - newWidth
                     }
                 }
             }
             
-            // Create a new detection with the transformed coordinates
-            YOLO11Detector.Detection(
+            // Create a new Detection with transformed coordinates
+            val newBox = YOLO11Detector.BoundingBox(
+                x = newX.toInt(),
+                y = newY.toInt(),
+                width = newWidth.toInt(),
+                height = newHeight.toInt()
+            )
+            transformed.add(YOLO11Detector.Detection(
                 classId = detection.classId,
                 conf = detection.conf,
-                box = YOLO11Detector.BoundingBox(
-                    x = newX.toInt(),
-                    y = newY.toInt(),
-                    width = newWidth.toInt(),
-                    height = newHeight.toInt()
-                )
-            )
+                box = newBox
+            ))
         }
+        
+        return transformed
+    }
+
+    /**
+     * Get the image rotation from camera
+     */
+    private fun getImageRotation(image: ImageProxy): Int {
+        return image.imageInfo.rotationDegrees
     }
 
     /**
@@ -696,16 +779,24 @@ class CameraManager(
         var position = 0
         if (yPixelStride == 1) {
             for (row in 0 until height) {
+                // Position buffer at start of row
                 yBuffer.position(row * yRowStride)
-                yBuffer.get(yuvBytes, position, width)
-                position += width
+                
+                // Copy pixels from this row
+                for (col in 0 until width) {
+                    yuvBytes[position++] = yBuffer.get()
+                }
             }
         } else {
             // Handle y plane with pixel stride > 1
             for (row in 0 until height) {
+                // Position buffer at start of row
                 yBuffer.position(row * yRowStride)
+                
+                // Copy pixels from this row
                 for (col in 0 until width) {
                     yuvBytes[position++] = yBuffer.get()
+                    // Skip extra pixels in row if needed
                     if (col < width - 1) yBuffer.position(yBuffer.position() + yPixelStride - 1)
                 }
             }
@@ -943,6 +1034,7 @@ class CameraManager(
         } else {
             CameraSelector.LENS_FACING_BACK
         }
+        isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
         
         // Get camera provider and rebind use cases
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
@@ -995,7 +1087,7 @@ class CameraManager(
                 context.display
             } else {
                 @Suppress("DEPRECATION")
-                (context as? android.app.Activity)?.windowManager?.defaultDisplay
+                (context as? AppCompatActivity)?.windowManager?.defaultDisplay
             }
             
             val rotation = when (display?.rotation) {
